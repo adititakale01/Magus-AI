@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
-from typing import Literal
+import re
+from typing import Any, Literal
+
+from src.config import AppConfig
+from src.llm_usage import usage_from_response
+from src.prompts import SOP_PARSE_SYSTEM_PROMPT, sop_parse_user_prompt
 
 
 Mode = Literal["air", "sea"]
@@ -10,8 +16,10 @@ Mode = Literal["air", "sea"]
 
 @dataclass(frozen=True)
 class SopProfile:
-    customer_email: str
     customer_name: str
+    match_emails: set[str] = field(default_factory=set)
+    match_domains: set[str] = field(default_factory=set)
+    match_domain_keywords: set[str] = field(default_factory=set)
     allowed_modes: set[Mode] | None = None
     margin_override: float | None = None
     sea_discount_pct: float | None = None
@@ -25,9 +33,36 @@ class SopProfile:
 
 
 @dataclass(frozen=True)
+class SopSurchargeRule:
+    amount: float
+    label: str
+    destination_canonical_in: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
 class SopSurcharge:
     amount: float
     label: str
+
+
+@dataclass(frozen=True)
+class SopConfig:
+    profiles: list[SopProfile] = field(default_factory=list)
+    global_surcharge_rules: list[SopSurchargeRule] = field(default_factory=list)
+    source: Literal["llm", "rule_based"] = "rule_based"
+
+
+@dataclass(frozen=True)
+class SopParseResult:
+    sop_config: SopConfig
+    sop_loaded: bool
+    sop_path: Path
+    cached: bool = False
+    llm_usage: dict[str, Any] | None = None
+    errors: list[str] = field(default_factory=list)
+
+
+_SOP_CACHE: dict[str, SopConfig] = {}
 
 
 def load_sop_markdown(*, data_dir: Path) -> str:
@@ -37,18 +72,129 @@ def load_sop_markdown(*, data_dir: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def get_sop_profile(sender_email: str) -> SopProfile | None:
-    sender = (sender_email or "").strip().casefold()
-    profiles = _profiles_by_sender()
-    return profiles.get(sender)
+def parse_sop(
+    *,
+    config: AppConfig,
+    canonical_origins: list[str],
+    canonical_destinations: list[str],
+    known_senders: list[str],
+) -> SopParseResult:
+    sop_path = (config.data.data_dir / "SOP.md").resolve()
+    sop_markdown = load_sop_markdown(data_dir=config.data.data_dir)
+    sop_loaded = bool(sop_markdown.strip())
+
+    key = _cache_key(
+        sop_markdown=sop_markdown,
+        model=config.openai.model,
+        canonical_origins=canonical_origins,
+        canonical_destinations=canonical_destinations,
+    )
+    if key in _SOP_CACHE:
+        cached_config = _SOP_CACHE[key]
+        return SopParseResult(
+            sop_config=cached_config,
+            sop_loaded=sop_loaded,
+            sop_path=sop_path,
+            cached=True,
+            llm_usage=None,
+            errors=[],
+        )
+
+    if not sop_loaded:
+        empty = SopConfig(profiles=[], global_surcharge_rules=[], source="rule_based")
+        _SOP_CACHE[key] = empty
+        return SopParseResult(sop_config=empty, sop_loaded=False, sop_path=sop_path, cached=False, errors=["SOP.md missing/empty"])
+
+    if config.openai.api_key:
+        try:
+            parsed, llm_usage = _parse_sop_with_openai(
+                sop_markdown=sop_markdown,
+                config=config,
+                canonical_origins=canonical_origins,
+                canonical_destinations=canonical_destinations,
+                known_senders=known_senders,
+            )
+            sop_config, errors = _build_sop_config_from_parsed(
+                parsed=parsed,
+                canonical_origins=canonical_origins,
+                canonical_destinations=canonical_destinations,
+            )
+            out = SopConfig(
+                profiles=sop_config.profiles,
+                global_surcharge_rules=sop_config.global_surcharge_rules,
+                source="llm",
+            )
+            _SOP_CACHE[key] = out
+            return SopParseResult(
+                sop_config=out,
+                sop_loaded=True,
+                sop_path=sop_path,
+                cached=False,
+                llm_usage=llm_usage,
+                errors=errors,
+            )
+        except Exception as e:  # noqa: BLE001
+            rule_based = _parse_sop_rule_based(
+                sop_markdown=sop_markdown,
+                canonical_origins=canonical_origins,
+                canonical_destinations=canonical_destinations,
+            )
+            out = SopConfig(
+                profiles=rule_based.profiles,
+                global_surcharge_rules=rule_based.global_surcharge_rules,
+                source="rule_based",
+            )
+            _SOP_CACHE[key] = out
+            return SopParseResult(
+                sop_config=out,
+                sop_loaded=True,
+                sop_path=sop_path,
+                cached=False,
+                llm_usage=None,
+                errors=[f"LLM parse failed, used rule-based fallback: {e.__class__.__name__}: {e}"],
+            )
+
+    rule_based = _parse_sop_rule_based(
+        sop_markdown=sop_markdown,
+        canonical_origins=canonical_origins,
+        canonical_destinations=canonical_destinations,
+    )
+    out = SopConfig(
+        profiles=rule_based.profiles,
+        global_surcharge_rules=rule_based.global_surcharge_rules,
+        source="rule_based",
+    )
+    _SOP_CACHE[key] = out
+    return SopParseResult(sop_config=out, sop_loaded=True, sop_path=sop_path, cached=False, llm_usage=None, errors=[])
 
 
-def get_global_surcharges(*, destination_canonical: str | None) -> list[SopSurcharge]:
+def get_sop_profile(*, sop_config: SopConfig, sender_email: str) -> SopProfile | None:
+    sender = _normalize_email(sender_email)
+    domain = _extract_domain(sender)
+    if not sender and not domain:
+        return None
+
+    best: SopProfile | None = None
+    best_score = 0
+    for profile in sop_config.profiles:
+        score = _match_score(profile=profile, sender_email=sender, sender_domain=domain)
+        if score > best_score:
+            best_score = score
+            best = profile
+    return best
+
+
+def get_global_surcharges(*, sop_config: SopConfig, destination_canonical: str | None) -> list[SopSurcharge]:
     if not destination_canonical:
         return []
-    if destination_canonical.strip().casefold() in {"melbourne"}:
-        return [SopSurcharge(amount=150.0, label="Biosecurity surcharge (Australia)")]
-    return []
+    dest = destination_canonical.strip().casefold()
+    out: list[SopSurcharge] = []
+    for rule in sop_config.global_surcharge_rules:
+        if not rule.destination_canonical_in:
+            continue
+        if dest in {d.casefold() for d in rule.destination_canonical_in}:
+            out.append(SopSurcharge(amount=float(rule.amount), label=str(rule.label)))
+    return out
 
 
 def volume_discount_pct(profile: SopProfile, *, total_containers: int) -> float:
@@ -64,43 +210,501 @@ def origin_fallbacks(profile: SopProfile, *, origin_canonical: str) -> list[str]
     return list(profile.origin_fallbacks.get(origin_canonical, []))
 
 
-def _profiles_by_sender() -> dict[str, SopProfile]:
-    return {
-        # SOP 1: Global Imports Ltd
-        "sarah.chen@globalimports.com": SopProfile(
-            customer_email="sarah.chen@globalimports.com",
-            customer_name="Global Imports Ltd",
-            allowed_modes={"sea"},
-            sea_discount_pct=0.10,
-            sea_discount_label="10% strategic partner discount (sea)",
-            origin_fallbacks={"Shanghai": ["Ningbo"], "Ningbo": ["Shanghai"]},
-        ),
-        # SOP 2: TechParts Inc (air-only)
-        "mike.johnson@techparts.io": SopProfile(
-            customer_email="mike.johnson@techparts.io",
-            customer_name="TechParts Inc",
-            allowed_modes={"air"},
-            transit_warning_if_gt_days=3,
-            show_actual_and_chargeable_weight=True,
-        ),
-        # SOP 3: AutoSpares GmbH (volume discount across all routes)
-        "david.mueller@autospares.de": SopProfile(
-            customer_email="david.mueller@autospares.de",
-            customer_name="AutoSpares GmbH",
-            container_volume_discount_tiers=[(5, 0.12), (2, 0.05)],
-        ),
-        # Appendix: QuickShip UK (broker margin)
-        "tom.bradley@quickship.co.uk": SopProfile(
-            customer_email="tom.bradley@quickship.co.uk",
-            customer_name="QuickShip UK",
-            margin_override=0.08,
-            hide_margin_percent=True,
-        ),
-        # Appendix: VietExport (origin restriction)
-        "lisa.nguyen@vietexport.vn": SopProfile(
-            customer_email="lisa.nguyen@vietexport.vn",
-            customer_name="VietExport",
-            origin_required={"Ho Chi Minh City"},
-        ),
+def _cache_key(
+    *,
+    sop_markdown: str,
+    model: str,
+    canonical_origins: list[str],
+    canonical_destinations: list[str],
+) -> str:
+    payload = {
+        "sop": sop_markdown,
+        "model": model,
+        "origins": sorted(set([str(x) for x in canonical_origins])),
+        "destinations": sorted(set([str(x) for x in canonical_destinations])),
     }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
+
+def _parse_sop_with_openai(
+    *,
+    sop_markdown: str,
+    config: AppConfig,
+    canonical_origins: list[str],
+    canonical_destinations: list[str],
+    known_senders: list[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    from openai import OpenAI
+
+    client = OpenAI(api_key=config.openai.api_key)
+    user = sop_parse_user_prompt(
+        sop_markdown=sop_markdown,
+        canonical_origins=canonical_origins,
+        canonical_destinations=canonical_destinations,
+        known_senders=known_senders,
+    )
+
+    resp = client.chat.completions.create(
+        model=config.openai.model,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": SOP_PARSE_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+    )
+    llm_usage = usage_from_response(resp, model=config.openai.model, calls=1)
+    content = resp.choices[0].message.content or ""
+    data = _coerce_json_object(content)
+    return data, llm_usage
+
+
+def _build_sop_config_from_parsed(
+    *,
+    parsed: dict[str, Any],
+    canonical_origins: list[str],
+    canonical_destinations: list[str],
+) -> tuple[SopConfig, list[str]]:
+    errors: list[str] = []
+
+    origin_lookup = _casefold_lookup(canonical_origins)
+    destination_lookup = _casefold_lookup(canonical_destinations)
+
+    profiles: list[SopProfile] = []
+    customers = parsed.get("customers") or []
+    if not isinstance(customers, list):
+        customers = []
+        errors.append("Parsed SOP: customers is not a list.")
+
+    for item in customers:
+        if not isinstance(item, dict):
+            continue
+
+        customer_name = str(item.get("customer_name") or "").strip()
+        if not customer_name:
+            continue
+
+        match = item.get("match") if isinstance(item.get("match"), dict) else {}
+        emails = [_normalize_email(x) for x in (match.get("emails") or []) if str(x).strip()]
+        domains = [str(x).strip().casefold() for x in (match.get("domains") or []) if str(x).strip()]
+        keywords = [str(x).strip().casefold() for x in (match.get("domain_keywords") or []) if str(x).strip()]
+
+        for email in list(emails):
+            dom = _extract_domain(email)
+            if dom:
+                domains.append(dom)
+
+        match_domains = {d for d in domains if d}
+        match_emails = {e for e in emails if e}
+        match_keywords = {k for k in keywords if k}
+        if not (match_emails or match_domains or match_keywords):
+            match_keywords = _keywords_from_name(customer_name)
+
+        allowed_modes = _parse_allowed_modes(item.get("allowed_modes"))
+        margin_override = _normalize_pct(item.get("margin_override_pct"))
+        hide_margin = _bool_or_none(item.get("hide_margin_percent"))
+
+        sea_discount_pct, sea_discount_label = _pick_sea_discount(item.get("discounts"))
+
+        origin_required: set[str] | None = None
+        raw_origin_required = item.get("origin_required")
+        if isinstance(raw_origin_required, list) and raw_origin_required:
+            resolved = {_pick_from_lookup(str(x), origin_lookup) for x in raw_origin_required if str(x).strip()}
+            origin_required = {x for x in resolved if x}
+
+        origin_fallbacks: dict[str, list[str]] = {}
+        for grp in item.get("origin_equivalence_groups") or []:
+            if not isinstance(grp, dict):
+                continue
+            if str(grp.get("scope") or "").strip().casefold() != "origin":
+                continue
+            locs = grp.get("locations") or []
+            if not isinstance(locs, list) or len(locs) < 2:
+                continue
+            resolved = [_pick_from_lookup(str(x), origin_lookup) for x in locs if str(x).strip()]
+            resolved = [x for x in resolved if x]
+            for loc in resolved:
+                others = [x for x in resolved if x != loc]
+                if others:
+                    origin_fallbacks.setdefault(loc, [])
+                    origin_fallbacks[loc].extend([x for x in others if x not in origin_fallbacks[loc]])
+
+        transit_warn = _int_or_none(item.get("transit_warning_if_gt_days"))
+        show_weights = bool(item.get("show_actual_and_chargeable_weight") or False)
+
+        tiers: list[tuple[int, float]] = []
+        for tier in item.get("container_volume_discount_tiers") or []:
+            if not isinstance(tier, dict):
+                continue
+            th = _int_or_none(tier.get("min_total_containers"))
+            pct = _normalize_pct(tier.get("discount_pct"))
+            if th and pct:
+                tiers.append((int(th), float(pct)))
+        tiers = sorted(list({(int(t[0]), float(t[1])) for t in tiers}), key=lambda x: -x[0])
+
+        profiles.append(
+            SopProfile(
+                customer_name=customer_name,
+                match_emails=match_emails,
+                match_domains=match_domains,
+                match_domain_keywords=match_keywords,
+                allowed_modes=allowed_modes,
+                margin_override=margin_override,
+                sea_discount_pct=sea_discount_pct,
+                sea_discount_label=sea_discount_label,
+                origin_required=origin_required,
+                origin_fallbacks=origin_fallbacks,
+                transit_warning_if_gt_days=transit_warn,
+                show_actual_and_chargeable_weight=show_weights,
+                hide_margin_percent=True if hide_margin is None else bool(hide_margin),
+                container_volume_discount_tiers=tiers,
+            )
+        )
+
+    global_rules: list[SopSurchargeRule] = []
+    surcharges = parsed.get("global_surcharges") or []
+    if not isinstance(surcharges, list):
+        surcharges = []
+        errors.append("Parsed SOP: global_surcharges is not a list.")
+
+    for item in surcharges:
+        if not isinstance(item, dict):
+            continue
+        amount = _float_or_none(item.get("amount"))
+        label = str(item.get("label") or "").strip()
+        if amount is None or not label:
+            continue
+        dests_raw = item.get("destination_canonical_in") or []
+        dests: set[str] = set()
+        if isinstance(dests_raw, list):
+            for d in dests_raw:
+                picked = _pick_from_lookup(str(d), destination_lookup)
+                if picked:
+                    dests.add(picked)
+        global_rules.append(SopSurchargeRule(amount=float(amount), label=label, destination_canonical_in=dests))
+
+    return SopConfig(profiles=profiles, global_surcharge_rules=global_rules, source="llm"), errors
+
+
+def _parse_sop_rule_based(
+    *,
+    sop_markdown: str,
+    canonical_origins: list[str],
+    canonical_destinations: list[str],
+) -> SopConfig:
+    origin_lookup = _casefold_lookup(canonical_origins)
+    destination_lookup = _casefold_lookup(canonical_destinations)
+
+    profiles: list[SopProfile] = []
+
+    for heading, block in _iter_markdown_sections(sop_markdown):
+        email = _match_one(block, r"(?im)^Customer Email:\s*([^\s]+@[^\s]+)\s*$")
+        if not email:
+            continue
+
+        name = heading
+        if ":" in name:
+            name = name.split(":", 1)[1].strip()
+        name = name.strip()
+        match_email = _normalize_email(email)
+        match_domain = _extract_domain(match_email) or ""
+
+        allowed_modes = None
+        if re.search(r"(?i)\bSea freight\b.*\bonly\b", block) or re.search(r"(?i)\bSea freight\b\s*\*\*only\*\*", block):
+            allowed_modes = {"sea"}
+        if re.search(r"(?i)\bAir freight\b.*\bonly\b", block) or re.search(r"(?i)\bAir freight\b\s*\*\*only\*\*", block):
+            allowed_modes = {"air"}
+
+        sea_discount_pct = None
+        sea_discount_label = None
+        disc = _match_one(block, r"(?i)^Discount:\s*([0-9]{1,2})%.*$", flags=re.MULTILINE)
+        if disc:
+            sea_discount_pct = _normalize_pct(disc)
+            if sea_discount_pct:
+                sea_discount_label = f"{int(round(sea_discount_pct * 100))}% discount (sea)"
+
+        origin_fallbacks: dict[str, list[str]] = {}
+        m = re.search(r"(?i)\b(.+?)\s+and\s+(.+?)\s+are\s+interchangeable\s+as\s+origins", block)
+        if m:
+            a = _pick_from_lookup(m.group(1), origin_lookup)
+            b = _pick_from_lookup(m.group(2), origin_lookup)
+            if a and b and a != b:
+                origin_fallbacks = {a: [b], b: [a]}
+
+        transit_warn = None
+        m = re.search(r"(?i)transit\s+time\s+exceeds\s+(\d+)\s+days", block)
+        if m:
+            transit_warn = _int_or_none(m.group(1))
+
+        show_weights = bool(re.search(r"(?i)show\s+both\s+actual\s+weight\s+and\s+chargeable\s+weight", block))
+
+        tiers: list[tuple[int, float]] = []
+        for pct_raw, th_raw in re.findall(r"(?i)(\d+)%\s+off\s+for\s+(\d+)\+\s+containers", block):
+            th = _int_or_none(th_raw)
+            pct = _normalize_pct(pct_raw)
+            if th and pct:
+                tiers.append((int(th), float(pct)))
+        tiers = sorted(list({(int(t[0]), float(t[1])) for t in tiers}), key=lambda x: -x[0])
+
+        profiles.append(
+            SopProfile(
+                customer_name=name or match_email,
+                match_emails={match_email} if match_email else set(),
+                match_domains={match_domain} if match_domain else set(),
+                match_domain_keywords=_keywords_from_name(name),
+                allowed_modes=allowed_modes,
+                sea_discount_pct=sea_discount_pct,
+                sea_discount_label=sea_discount_label,
+                origin_fallbacks=origin_fallbacks,
+                transit_warning_if_gt_days=transit_warn,
+                show_actual_and_chargeable_weight=show_weights,
+                container_volume_discount_tiers=tiers,
+            )
+        )
+
+    appendix = _extract_appendix_items(sop_markdown)
+    for item in appendix:
+        name = item["name"]
+        block = item["block"]
+        if not name:
+            continue
+        if "australia destination" in name.casefold():
+            continue
+
+        margin_override = None
+        m = re.search(r"(?i)use\s+(\d+)%\s+margin", block)
+        if m:
+            margin_override = _normalize_pct(m.group(1))
+
+        origin_required: set[str] | None = None
+        m = re.search(r"(?i)origin\s+restriction\s*:\s*(.+?)\s+only", block)
+        if m:
+            raw_loc = m.group(1).strip()
+            picked = _pick_from_lookup(raw_loc, origin_lookup)
+            if picked:
+                origin_required = {picked}
+
+        profiles.append(
+            SopProfile(
+                customer_name=name,
+                match_domain_keywords=_keywords_from_name(name),
+                margin_override=margin_override,
+                origin_required=origin_required,
+                hide_margin_percent=True,
+            )
+        )
+
+    global_surcharge_rules: list[SopSurchargeRule] = []
+    if re.search(r"(?i)australia destination", sop_markdown) and re.search(r"(?i)\$\s*150", sop_markdown):
+        australian_city_tokens = {"melbourne", "sydney", "brisbane", "perth", "adelaide"}
+        destinations = {d for d in canonical_destinations if d.casefold() in australian_city_tokens}
+        if destinations:
+            global_surcharge_rules.append(
+                SopSurchargeRule(amount=150.0, label="Biosecurity surcharge (Australia)", destination_canonical_in=destinations)
+            )
+        else:
+            melbourne = _pick_from_lookup("Melbourne", destination_lookup)
+            if melbourne:
+                global_surcharge_rules.append(
+                    SopSurchargeRule(amount=150.0, label="Biosecurity surcharge (Australia)", destination_canonical_in={melbourne})
+                )
+
+    return SopConfig(profiles=profiles, global_surcharge_rules=global_surcharge_rules, source="rule_based")
+
+
+def _iter_markdown_sections(markdown: str) -> list[tuple[str, str]]:
+    lines = markdown.splitlines()
+    indices: list[tuple[int, str]] = []
+    for idx, line in enumerate(lines):
+        if line.startswith("## "):
+            indices.append((idx, line[3:].strip()))
+
+    sections: list[tuple[str, str]] = []
+    for i, (start, title) in enumerate(indices):
+        end = indices[i + 1][0] if i + 1 < len(indices) else len(lines)
+        block = "\n".join(lines[start + 1 : end]).strip()
+        sections.append((title, block))
+    return sections
+
+
+def _extract_appendix_items(markdown: str) -> list[dict[str, str]]:
+    m = re.search(r"(?im)^##\s+Appendix\b.*$", markdown)
+    if not m:
+        return []
+    tail = markdown[m.start() :]
+    items: list[dict[str, str]] = []
+    for match in re.finditer(r"(?m)^\s*\d+\.\s+(.+?)\s*$", tail):
+        name = match.group(1).strip()
+        start = match.end()
+        next_m = re.search(r"(?m)^\s*\d+\.\s+.+\s*$", tail[start:])
+        end = start + (next_m.start() if next_m else len(tail[start:]))
+        block = tail[start:end].strip()
+        items.append({"name": name, "block": block})
+    return items
+
+
+def _match_one(text: str, pattern: str, *, flags: int = 0) -> str | None:
+    m = re.search(pattern, text, flags=flags)
+    if not m:
+        return None
+    return m.group(1).strip() if m.group(1) else None
+
+
+def _coerce_json_object(text: str) -> dict[str, Any]:
+    text = str(text or "").strip()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        raise ValueError("Model did not return JSON.")
+    obj = json.loads(m.group(0))
+    if not isinstance(obj, dict):
+        raise ValueError("JSON root is not an object.")
+    return obj
+
+
+def _casefold_lookup(values: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for v in values:
+        key = str(v).strip().casefold()
+        if key:
+            out[key] = str(v)
+    return out
+
+
+def _pick_from_lookup(raw: str, lookup: dict[str, str]) -> str | None:
+    key = str(raw or "").strip()
+    if not key:
+        return None
+    cf = key.casefold()
+    if cf in lookup:
+        return lookup[cf]
+    cf2 = re.sub(r"[^a-z0-9]+", " ", cf).strip()
+    if cf2 in lookup:
+        return lookup[cf2]
+    return None
+
+
+def _normalize_email(value: str | None) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _extract_domain(email: str | None) -> str | None:
+    e = str(email or "").strip().casefold()
+    if "@" not in e:
+        return None
+    return e.split("@", 1)[1].strip() or None
+
+
+def _keywords_from_name(name: str) -> set[str]:
+    words = [re.sub(r"[^a-z0-9]+", "", w.casefold()) for w in str(name or "").split()]
+    words = [w for w in words if len(w) >= 4]
+    return set(words[:3]) if words else set()
+
+
+def _parse_allowed_modes(value: Any) -> set[Mode] | None:
+    if not value:
+        return None
+    if not isinstance(value, list):
+        return None
+    modes: set[Mode] = set()
+    for m in value:
+        s = str(m).strip().casefold()
+        if s in {"air", "sea"}:
+            modes.add(s)  # type: ignore[arg-type]
+    return modes or None
+
+
+def _normalize_pct(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        s = s.replace("%", "")
+        try:
+            v = float(s)
+        except ValueError:
+            return None
+    if v > 1.0:
+        v = v / 100.0
+    if v < 0:
+        return None
+    return float(v)
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().casefold()
+    if s in {"true", "yes", "1"}:
+        return True
+    if s in {"false", "no", "0"}:
+        return False
+    return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pick_sea_discount(discounts: Any) -> tuple[float | None, str | None]:
+    if not discounts or not isinstance(discounts, list):
+        return None, None
+    best_pct = 0.0
+    best_label: str | None = None
+    for d in discounts:
+        if not isinstance(d, dict):
+            continue
+        mode = d.get("mode")
+        if mode is not None and str(mode).strip().casefold() not in {"sea"}:
+            continue
+        pct = _normalize_pct(d.get("discount_pct"))
+        if not pct or pct <= 0:
+            continue
+        apply_before_margin = bool(d.get("apply_before_margin", True))
+        if not apply_before_margin:
+            continue
+        label = str(d.get("label") or "").strip() or None
+        if pct > best_pct:
+            best_pct = pct
+            best_label = label
+    return (best_pct or None), best_label
+
+
+def _match_score(*, profile: SopProfile, sender_email: str | None, sender_domain: str | None) -> int:
+    sender = sender_email or ""
+    domain = sender_domain or ""
+    has_explicit_match = bool(profile.match_emails or profile.match_domains)
+    if sender and sender in {e.casefold() for e in profile.match_emails}:
+        return 3
+    if domain and domain in {d.casefold() for d in profile.match_domains}:
+        return 2
+    if (not has_explicit_match) and domain and profile.match_domain_keywords:
+        for kw in profile.match_domain_keywords:
+            if kw and kw.casefold() in domain:
+                return 1
+    return 0

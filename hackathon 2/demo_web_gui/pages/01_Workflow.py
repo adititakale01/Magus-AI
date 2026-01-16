@@ -13,8 +13,11 @@ from src.prompts import (
     EXTRACTION_SYSTEM_PROMPT,
     LOCATION_MATCH_RESPONSE_SCHEMA,
     LOCATION_MATCH_SYSTEM_PROMPT,
+    SOP_PARSE_RESPONSE_SCHEMA,
+    SOP_PARSE_SYSTEM_PROMPT,
     extraction_user_prompt,
     location_match_user_prompt,
+    sop_parse_user_prompt,
 )
 from src.rate_sheets import normalize_rate_sheets
 
@@ -204,12 +207,12 @@ After normalization, matching is deterministic:
             """
 SOPs are **optional**. When enabled, they override default quoting rules for specific customers.
 
-**Implementation overview**
-- The SOP spec lives in `hackathon_data/SOP.md`.
-- This demo implements those rules as **code-backed profiles** (not a full SOP.md parser yet):
-  - Profiles + helpers: `src/sop.py`
-  - SOP wiring + enforcement: `src/pipeline.py` (`enable_sop=True`)
-  - Pricing order (discount → margin → surcharge): `src/quote_logic.py` (`compute_quote_amounts`)
+**Implementation overview (LLM-parsed, not hardcoded)**
+- Spec: `hackathon_data/SOP.md` (Markdown).
+- Parsing: `src/sop.py` (`parse_sop`) converts SOP.md → typed `SopConfig` using OpenAI when an API key is present, with a rule-based fallback.
+- Prompt + schema: `src/prompts.py` (`SOP_PARSE_SYSTEM_PROMPT`, `SOP_PARSE_RESPONSE_SCHEMA`)
+- Enforcement: `src/pipeline.py` (hard gates + lookup fallbacks + pricing + formatting)
+- Pricing order (discount → margin → surcharge): `src/quote_logic.py` (`compute_quote_amounts`)
 
 **How a SOP is applied (high level)**
 1. Identify the customer by sender email → load a `SopProfile`.
@@ -222,7 +225,10 @@ SOPs are **optional**. When enabled, they override default quoting rules for spe
 ---
 
 ### A) Customer identification
-`get_sop_profile(sender_email)` returns a `SopProfile` keyed by sender email (case-insensitive).
+`get_sop_profile(sop_config, sender_email)` returns the best matching `SopProfile` using:
+- exact email match (highest priority)
+- domain match
+- domain keyword match (fallback when SOP has no explicit email)
 
 ---
 
@@ -276,7 +282,8 @@ final = final_before_surcharge + fixed_surcharge
 - Margin percent is **not shown** in customer-facing text (we only show final prices).
 
 **4) Global fixed surcharge**
-- Australia destination: +$150 biosecurity surcharge (currently triggered for destination canonical `"Melbourne"`).
+- Example: Australia destination +$150 biosecurity surcharge.
+- Parsed into a `global_surcharges` rule and applied when `destination_canonical` is in the configured destination set.
 - Added as a separate note line in the quote.
 
 ---
@@ -296,6 +303,58 @@ These rules only affect how the answer is presented:
 **4) SOP-aware reply email wrapper**
 - When SOP is enabled, the final output is wrapped as an English email reply and states that SOP was applied.
 """
+        )
+        st.markdown("**SOP parsing prompt (OpenAI) + schema**")
+        st.json(
+            {
+                "model": "{openai.model}",
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": SOP_PARSE_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": sop_parse_user_prompt(
+                            sop_markdown=(
+                                "## Global Imports\n"
+                                "Customer Email: ops@globalimports.com\n"
+                                "- Sea freight only\n"
+                                "- Discount: 10% (apply before margin)\n"
+                                "- Shanghai and Ningbo are interchangeable as origins\n"
+                            ),
+                            canonical_origins=["Shanghai", "Ningbo", "..."],
+                            canonical_destinations=["Melbourne", "Hamburg", "..."],
+                            known_senders=["ops@globalimports.com", "sales@quickship.co.uk", "..."],
+                        ),
+                    },
+                ],
+                "response_format": {"type": "json_object"},
+            }
+        )
+        st.markdown("**OpenAI response schema**")
+        st.json(SOP_PARSE_RESPONSE_SCHEMA)
+        st.markdown("**Test I/O example (SOP parser)**")
+        st.code(
+            "Input (SOP.md excerpt):\n"
+            "## Global Imports\n"
+            "Customer Email: ops@globalimports.com\n"
+            "Sea freight only.\n"
+            "Discount: 10% (apply before margin)\n"
+            "Shanghai and Ningbo are interchangeable as origins.\n"
+            "\n"
+            "Expected output (simplified):\n"
+            "{\n"
+            "  \"customers\": [\n"
+            "    {\n"
+            "      \"customer_name\": \"Global Imports\",\n"
+            "      \"match\": {\"emails\": [\"ops@globalimports.com\"]},\n"
+            "      \"allowed_modes\": [\"sea\"],\n"
+            "      \"discounts\": [{\"mode\": \"sea\", \"discount_pct\": 0.10, \"apply_before_margin\": true}],\n"
+            "      \"origin_equivalence_groups\": [{\"scope\": \"origin\", \"locations\": [\"Shanghai\", \"Ningbo\"]}]\n"
+            "    }\n"
+            "  ],\n"
+            "  \"global_surcharges\": []\n"
+            "}\n",
+            language="text",
         )
         st.markdown("**Concrete examples**")
         st.code(

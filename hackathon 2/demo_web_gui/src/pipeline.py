@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 
 from src.agent import ShipmentRequest, extract_requests
 from src.config import AppConfig
-from src.data_loader import EmailMessage
+from src.data_loader import EmailMessage, list_emails, load_email
 from src.normalize import LocationResolution, clean_text, recommend_containers, resolve_location
 from src.quote_logic import (
     compute_quote_amounts,
@@ -14,11 +14,13 @@ from src.quote_logic import (
 from src.rate_sheets import NormalizedRateSheets, normalize_rate_sheets
 from src.llm_usage import sum_usage
 from src.sop import (
+    SopConfig,
+    SopParseResult,
     SopProfile,
     get_global_surcharges,
     get_sop_profile,
-    load_sop_markdown,
     origin_fallbacks as sop_origin_fallbacks,
+    parse_sop,
     volume_discount_pct,
 )
 from src.trace import RunTrace
@@ -73,30 +75,9 @@ def run_quote_pipeline(
 
     extraction = extract_requests(email=email, config=config, trace=trace, use_openai=use_openai)
 
-    sop_profile = get_sop_profile(email.sender) if enable_sop else None
-    sop_path = (config.data.data_dir / "SOP.md").resolve()
-    sop_loaded = bool(load_sop_markdown(data_dir=config.data.data_dir)) if enable_sop else False
-    trace.add(
-        "SOP",
-        summary="Applied customer-specific SOP rules." if enable_sop else "SOP disabled.",
-        data={
-            "enabled": enable_sop,
-            "sop_path": str(sop_path),
-            "sop_found": sop_path.exists(),
-            "sop_loaded": sop_loaded,
-            "customer_email": email.sender,
-            "matched_profile": {
-                "customer_name": sop_profile.customer_name,
-                "allowed_modes": sorted(list(sop_profile.allowed_modes)) if sop_profile and sop_profile.allowed_modes else None,
-                "margin_override": sop_profile.margin_override if sop_profile else None,
-                "sea_discount_pct": sop_profile.sea_discount_pct if sop_profile else None,
-                "container_volume_discount_tiers": sop_profile.container_volume_discount_tiers if sop_profile else None,
-                "origin_required": sorted(list(sop_profile.origin_required)) if sop_profile and sop_profile.origin_required else None,
-            }
-            if sop_profile
-            else None,
-        },
-    )
+    sop_result: SopParseResult | None = None
+    sop_config = SopConfig()
+    sop_profile: SopProfile | None = None
 
     if rate_sheets is None:
         rate_sheets = normalize_rate_sheets(config=config, difficulty=difficulty)
@@ -132,9 +113,69 @@ def run_quote_pipeline(
 
     merged_aliases = _merge_aliases(config.aliases, rate_sheets.aliases)
     merged_codes = {**rate_sheets.codes, **config.codes}
+
+    if enable_sop:
+        email_index = list_emails(config.data.data_dir)
+        known_senders: list[str] = []
+        for path in email_index.values():
+            try:
+                msg = load_email(path)
+            except Exception:
+                continue
+            sender = str(msg.sender or "").strip()
+            if sender:
+                known_senders.append(sender)
+        known_senders = sorted(set(known_senders))
+
+        canonical_origins = sorted(set(air_origins + sea_origins))
+        canonical_destinations = sorted(set(air_destinations + sea_destinations))
+        sop_result = parse_sop(
+            config=config,
+            canonical_origins=canonical_origins,
+            canonical_destinations=canonical_destinations,
+            known_senders=known_senders,
+        )
+        sop_config = sop_result.sop_config
+        sop_profile = get_sop_profile(sop_config=sop_config, sender_email=email.sender)
+
     effective_margin = float(config.pricing.margin)
     if enable_sop and sop_profile and sop_profile.margin_override is not None:
         effective_margin = float(sop_profile.margin_override)
+
+    sop_path = (config.data.data_dir / "SOP.md").resolve()
+    sop_found = sop_path.exists()
+    sop_loaded = bool(sop_result.sop_loaded) if sop_result else False
+    trace.add(
+        "SOP",
+        summary="Applied customer-specific SOP rules." if enable_sop else "SOP disabled.",
+        data={
+            "enabled": enable_sop,
+            "sop_path": str(sop_path),
+            "sop_found": sop_found,
+            "sop_loaded": sop_loaded,
+            "parse_source": sop_config.source if enable_sop else None,
+            "parse_cached": sop_result.cached if sop_result else None,
+            "parse_errors": sop_result.errors if sop_result else None,
+            "customer_email": email.sender,
+            "matched_profile": {
+                "customer_name": sop_profile.customer_name,
+                "allowed_modes": sorted(list(sop_profile.allowed_modes)) if sop_profile and sop_profile.allowed_modes else None,
+                "margin_override": sop_profile.margin_override if sop_profile else None,
+                "sea_discount_pct": sop_profile.sea_discount_pct if sop_profile else None,
+                "container_volume_discount_tiers": sop_profile.container_volume_discount_tiers if sop_profile else None,
+                "origin_required": sorted(list(sop_profile.origin_required)) if sop_profile and sop_profile.origin_required else None,
+                "match_emails": sorted(list(sop_profile.match_emails)) if sop_profile and sop_profile.match_emails else None,
+                "match_domains": sorted(list(sop_profile.match_domains)) if sop_profile and sop_profile.match_domains else None,
+                "match_domain_keywords": sorted(list(sop_profile.match_domain_keywords))
+                if sop_profile and sop_profile.match_domain_keywords
+                else None,
+            }
+            if sop_profile
+            else None,
+        },
+        used_llm=bool(sop_result and sop_result.llm_usage),
+        llm_usage=sop_result.llm_usage if sop_result else None,
+    )
 
     trace.add(
         "Config Match",
@@ -256,7 +297,11 @@ def run_quote_pipeline(
                 continue
 
             trace.add("Rate Lookup (Air)", summary="Matched air rate row.", data=asdict(rate))
-            surcharges = get_global_surcharges(destination_canonical=dest_res.canonical) if enable_sop else []
+            surcharges = (
+                get_global_surcharges(sop_config=sop_config, destination_canonical=dest_res.canonical)
+                if enable_sop
+                else []
+            )
             surcharge_total = sum(float(s.amount) for s in surcharges)
             amounts = compute_quote_amounts(
                 request=shipment,
@@ -405,7 +450,14 @@ def run_quote_pipeline(
                             sop_profile=sop_profile if enable_sop else None,
                         )
                         if alt_rate:
-                            surcharges = get_global_surcharges(destination_canonical=dest_res.canonical) if enable_sop else []
+                            surcharges = (
+                                get_global_surcharges(
+                                    sop_config=sop_config,
+                                    destination_canonical=dest_res.canonical,
+                                )
+                                if enable_sop
+                                else []
+                            )
                             surcharge_total = sum(float(s.amount) for s in surcharges)
                             alt_effective = ShipmentRequest(
                                 mode="sea",
@@ -502,7 +554,11 @@ def run_quote_pipeline(
                     discount_pct = float(container_discount_pct)
                     discount_note = container_discount_label
 
-            surcharges = get_global_surcharges(destination_canonical=dest_res.canonical) if enable_sop else []
+            surcharges = (
+                get_global_surcharges(sop_config=sop_config, destination_canonical=dest_res.canonical)
+                if enable_sop
+                else []
+            )
             surcharge_total = sum(float(s.amount) for s in surcharges)
 
             amounts = compute_quote_amounts(
