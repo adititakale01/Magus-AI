@@ -19,6 +19,7 @@ from src.sop import (
     SopProfile,
     get_global_surcharges,
     get_sop_profile,
+    load_sop_markdown,
     origin_fallbacks as sop_origin_fallbacks,
     parse_sop,
     volume_discount_pct,
@@ -64,6 +65,7 @@ def run_quote_pipeline(
     use_openai: bool,
     rate_sheets: NormalizedRateSheets | None = None,
     enable_sop: bool = False,
+    sop_config: SopConfig | None = None,
 ) -> PipelineResult:
     trace = RunTrace()
 
@@ -76,8 +78,9 @@ def run_quote_pipeline(
     extraction = extract_requests(email=email, config=config, trace=trace, use_openai=use_openai)
 
     sop_result: SopParseResult | None = None
-    sop_config = SopConfig()
+    active_sop_config = SopConfig()
     sop_profile: SopProfile | None = None
+    sop_preparsed = False
 
     if rate_sheets is None:
         rate_sheets = normalize_rate_sheets(config=config, difficulty=difficulty)
@@ -114,7 +117,11 @@ def run_quote_pipeline(
     merged_aliases = _merge_aliases(config.aliases, rate_sheets.aliases)
     merged_codes = {**rate_sheets.codes, **config.codes}
 
-    if enable_sop:
+    if enable_sop and sop_config is not None:
+        active_sop_config = sop_config
+        sop_profile = get_sop_profile(sop_config=active_sop_config, sender_email=email.sender)
+        sop_preparsed = True
+    elif enable_sop:
         email_index = list_emails(config.data.data_dir)
         known_senders: list[str] = []
         for path in email_index.values():
@@ -135,8 +142,8 @@ def run_quote_pipeline(
             canonical_destinations=canonical_destinations,
             known_senders=known_senders,
         )
-        sop_config = sop_result.sop_config
-        sop_profile = get_sop_profile(sop_config=sop_config, sender_email=email.sender)
+        active_sop_config = sop_result.sop_config
+        sop_profile = get_sop_profile(sop_config=active_sop_config, sender_email=email.sender)
 
     effective_margin = float(config.pricing.margin)
     if enable_sop and sop_profile and sop_profile.margin_override is not None:
@@ -144,7 +151,9 @@ def run_quote_pipeline(
 
     sop_path = (config.data.data_dir / "SOP.md").resolve()
     sop_found = sop_path.exists()
-    sop_loaded = bool(sop_result.sop_loaded) if sop_result else False
+    sop_loaded = False
+    if enable_sop:
+        sop_loaded = bool(sop_result.sop_loaded) if sop_result else bool(load_sop_markdown(data_dir=config.data.data_dir).strip())
     trace.add(
         "SOP",
         summary="Applied customer-specific SOP rules." if enable_sop else "SOP disabled.",
@@ -153,7 +162,8 @@ def run_quote_pipeline(
             "sop_path": str(sop_path),
             "sop_found": sop_found,
             "sop_loaded": sop_loaded,
-            "parse_source": sop_config.source if enable_sop else None,
+            "preparsed": sop_preparsed if enable_sop else None,
+            "parse_source": active_sop_config.source if enable_sop else None,
             "parse_cached": sop_result.cached if sop_result else None,
             "parse_errors": sop_result.errors if sop_result else None,
             "customer_email": email.sender,
@@ -298,7 +308,7 @@ def run_quote_pipeline(
 
             trace.add("Rate Lookup (Air)", summary="Matched air rate row.", data=asdict(rate))
             surcharges = (
-                get_global_surcharges(sop_config=sop_config, destination_canonical=dest_res.canonical)
+                get_global_surcharges(sop_config=active_sop_config, destination_canonical=dest_res.canonical)
                 if enable_sop
                 else []
             )
@@ -452,7 +462,7 @@ def run_quote_pipeline(
                         if alt_rate:
                             surcharges = (
                                 get_global_surcharges(
-                                    sop_config=sop_config,
+                                    sop_config=active_sop_config,
                                     destination_canonical=dest_res.canonical,
                                 )
                                 if enable_sop
@@ -555,7 +565,7 @@ def run_quote_pipeline(
                     discount_note = container_discount_label
 
             surcharges = (
-                get_global_surcharges(sop_config=sop_config, destination_canonical=dest_res.canonical)
+                get_global_surcharges(sop_config=active_sop_config, destination_canonical=dest_res.canonical)
                 if enable_sop
                 else []
             )

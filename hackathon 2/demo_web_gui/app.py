@@ -11,6 +11,7 @@ from src.config import load_app_config
 from src.data_loader import list_emails, load_email
 from src.pipeline import run_quote_pipeline
 from src.rate_sheets import NormalizedRateSheets, normalize_rate_sheets
+from src.sop import SopParseResult, load_sop_markdown, parse_sop
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -47,6 +48,41 @@ def _get_cached_rates(
         rates_cache.pop(difficulty, None)
         return None
     return rates
+
+
+def _get_sop_parse_cache() -> dict[str, SopParseResult]:
+    if "sop_parse_results" not in st.session_state:
+        st.session_state["sop_parse_results"] = {}
+    return st.session_state["sop_parse_results"]
+
+
+def _sop_parse_key(
+    *,
+    sop_markdown: str,
+    model: str,
+    canonical_origins: list[str],
+    canonical_destinations: list[str],
+) -> str:
+    payload = {
+        "sop": sop_markdown,
+        "model": model,
+        "origins": sorted(set([str(x) for x in canonical_origins])),
+        "destinations": sorted(set([str(x) for x in canonical_destinations])),
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+def _list_known_senders(email_index: dict[str, Path]) -> list[str]:
+    senders: list[str] = []
+    for path in email_index.values():
+        try:
+            msg = load_email(path)
+        except Exception:
+            continue
+        sender = str(msg.sender or "").strip()
+        if sender:
+            senders.append(sender)
+    return sorted(set(senders))
 
 
 def main() -> None:
@@ -132,10 +168,10 @@ def main() -> None:
             if rates.warnings:
                 st.warning("Warnings:\n- " + "\n- ".join(rates.warnings))
 
-            st.markdown("**Normalized: Sea**")
-            st.dataframe(rates.sea, use_container_width=True)
-            st.markdown("**Normalized: Air**")
-            st.dataframe(rates.air, use_container_width=True)
+            with st.expander("Normalized: Sea", expanded=False):
+                st.dataframe(rates.sea, use_container_width=True)
+            with st.expander("Normalized: Air", expanded=False):
+                st.dataframe(rates.air, use_container_width=True)
 
             with st.expander("Mappings (codes / aliases)", expanded=False):
                 st.write({"codes": rates.codes, "aliases": rates.aliases})
@@ -153,6 +189,91 @@ def main() -> None:
     selected_rates = _get_cached_rates(rates_cache=rates_cache, difficulty=difficulty, source_path=paths[difficulty])
     if not selected_rates:
         st.info(f"Normalize the `{difficulty}` sheet to enable quoting.")
+
+    sop_parse_result: SopParseResult | None = None
+    sop_config_for_pipeline = None
+    if enable_sop:
+        st.markdown("**SOP parsing (once, reused for all emails)**")
+        st.caption("Parses `SOP.md` once using canonical locations from the normalized sheet, and reuses it for all email runs.")
+        if selected_rates is None:
+            st.info("Normalize the selected difficulty first to parse SOP.")
+        else:
+            df_air = selected_rates.air
+            df_sea = selected_rates.sea
+            canonical_origins = sorted(
+                set(
+                    [str(x) for x in df_air["Origin"].dropna().tolist()]
+                    + [str(x) for x in df_sea["Origin"].dropna().tolist()]
+                )
+            )
+            canonical_destinations = sorted(
+                set(
+                    [str(x) for x in df_air["Destination"].dropna().tolist()]
+                    + [str(x) for x in df_sea["Destination"].dropna().tolist()]
+                )
+            )
+            sop_markdown = load_sop_markdown(data_dir=config.data.data_dir)
+            key = _sop_parse_key(
+                sop_markdown=sop_markdown,
+                model=config.openai.model,
+                canonical_origins=canonical_origins,
+                canonical_destinations=canonical_destinations,
+            )
+            sop_cache = _get_sop_parse_cache()
+            sop_parse_result = sop_cache.get(key)
+
+            left, right = st.columns([0.25, 0.75])
+            with left:
+                parse_now = st.button("Parse SOP", type="secondary", key="parse_sop_now")
+            with right:
+                st.write(
+                    {
+                        "origins": len(canonical_origins),
+                        "destinations": len(canonical_destinations),
+                        "sop_md_loaded": bool(sop_markdown.strip()),
+                    }
+                )
+
+            if sop_parse_result is None or parse_now:
+                with st.spinner("Parsing SOP..."):
+                    sop_parse_result = parse_sop(
+                        config=config,
+                        canonical_origins=canonical_origins,
+                        canonical_destinations=canonical_destinations,
+                        known_senders=_list_known_senders(email_index),
+                        force_refresh=bool(parse_now),
+                    )
+                sop_cache[key] = sop_parse_result
+
+            if sop_parse_result:
+                sop_config_for_pipeline = sop_parse_result.sop_config
+                st.write(
+                    {
+                        "sop_path": str(sop_parse_result.sop_path),
+                        "sop_loaded": sop_parse_result.sop_loaded,
+                        "parse_source": sop_parse_result.sop_config.source,
+                        "profiles": len(sop_parse_result.sop_config.profiles),
+                        "global_surcharge_rules": len(sop_parse_result.sop_config.global_surcharge_rules),
+                        "cached": sop_parse_result.cached,
+                    }
+                )
+                if sop_parse_result.errors:
+                    st.warning("SOP parse notes:\n- " + "\n- ".join(sop_parse_result.errors))
+                if sop_parse_result.llm_usage:
+                    st.caption(
+                        "LLM usage: "
+                        + ", ".join(
+                            [
+                                f"calls={sop_parse_result.llm_usage.get('calls')}",
+                                f"prompt={sop_parse_result.llm_usage.get('prompt_tokens')}",
+                                f"completion={sop_parse_result.llm_usage.get('completion_tokens')}",
+                                f"total={sop_parse_result.llm_usage.get('total_tokens')}",
+                            ]
+                        )
+                    )
+                if sop_parse_result.llm_raw:
+                    with st.expander("SOP parser LLM raw output (JSON)", expanded=False):
+                        st.json(sop_parse_result.llm_raw)
 
     col_left, col_right = st.columns([0.45, 0.55], gap="large")
 
@@ -233,6 +354,7 @@ def main() -> None:
                     use_openai=use_openai,
                     rate_sheets=selected_rates,
                     enable_sop=enable_sop,
+                    sop_config=sop_config_for_pipeline,
                 )
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
 

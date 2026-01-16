@@ -59,6 +59,7 @@ class SopParseResult:
     sop_path: Path
     cached: bool = False
     llm_usage: dict[str, Any] | None = None
+    llm_raw: dict[str, Any] | None = None
     errors: list[str] = field(default_factory=list)
 
 
@@ -78,6 +79,7 @@ def parse_sop(
     canonical_origins: list[str],
     canonical_destinations: list[str],
     known_senders: list[str],
+    force_refresh: bool = False,
 ) -> SopParseResult:
     sop_path = (config.data.data_dir / "SOP.md").resolve()
     sop_markdown = load_sop_markdown(data_dir=config.data.data_dir)
@@ -89,7 +91,7 @@ def parse_sop(
         canonical_origins=canonical_origins,
         canonical_destinations=canonical_destinations,
     )
-    if key in _SOP_CACHE:
+    if not force_refresh and key in _SOP_CACHE:
         cached_config = _SOP_CACHE[key]
         return SopParseResult(
             sop_config=cached_config,
@@ -124,6 +126,79 @@ def parse_sop(
                 global_surcharge_rules=sop_config.global_surcharge_rules,
                 source="llm",
             )
+            rule_based = _parse_sop_rule_based(
+                sop_markdown=sop_markdown,
+                canonical_origins=canonical_origins,
+                canonical_destinations=canonical_destinations,
+            )
+            if not out.profiles and not out.global_surcharge_rules:
+                if rule_based.profiles or rule_based.global_surcharge_rules:
+                    out = SopConfig(
+                        profiles=rule_based.profiles,
+                        global_surcharge_rules=rule_based.global_surcharge_rules,
+                        source="rule_based",
+                    )
+                    errors = list(errors) + ["LLM parse output could not be converted to SOP rules, used rule-based fallback."]
+            else:
+                merged_profiles = list(out.profiles)
+                email_to_idx: dict[str, int] = {}
+                name_to_idx: dict[str, int] = {}
+                for idx, p in enumerate(merged_profiles):
+                    if p.customer_name:
+                        name_to_idx[p.customer_name.strip().casefold()] = idx
+                    for e in p.match_emails:
+                        if e:
+                            email_to_idx[e.casefold()] = idx
+
+                for rb in rule_based.profiles:
+                    rb_name = rb.customer_name.strip().casefold() if rb.customer_name else ""
+                    matched_idx: int | None = None
+                    if rb.match_emails:
+                        for e in rb.match_emails:
+                            idx = email_to_idx.get(str(e).casefold())
+                            if idx is not None:
+                                matched_idx = idx
+                                break
+                    if matched_idx is None and rb_name:
+                        matched_idx = name_to_idx.get(rb_name)
+
+                    if matched_idx is None:
+                        merged_profiles.append(rb)
+                        matched_idx = len(merged_profiles) - 1
+                    else:
+                        merged_profiles[matched_idx] = _merge_profile(primary=merged_profiles[matched_idx], fallback=rb)
+
+                    p = merged_profiles[matched_idx]
+                    if p.customer_name:
+                        name_to_idx[p.customer_name.strip().casefold()] = matched_idx
+                    for e in p.match_emails:
+                        if e:
+                            email_to_idx[e.casefold()] = matched_idx
+
+                merged_surcharges = list(out.global_surcharge_rules)
+                surcharge_to_idx: dict[tuple[float, str], int] = {}
+                for idx, r in enumerate(merged_surcharges):
+                    key = (round(float(r.amount), 2), str(r.label or "").strip().casefold())
+                    surcharge_to_idx[key] = idx
+                for rb in rule_based.global_surcharge_rules:
+                    key = (round(float(rb.amount), 2), str(rb.label or "").strip().casefold())
+                    idx = surcharge_to_idx.get(key)
+                    if idx is None:
+                        merged_surcharges.append(rb)
+                        surcharge_to_idx[key] = len(merged_surcharges) - 1
+                        continue
+                    existing = merged_surcharges[idx]
+                    merged_surcharges[idx] = SopSurchargeRule(
+                        amount=float(existing.amount),
+                        label=str(existing.label),
+                        destination_canonical_in=set(existing.destination_canonical_in) | set(rb.destination_canonical_in),
+                    )
+
+                out = SopConfig(
+                    profiles=merged_profiles,
+                    global_surcharge_rules=merged_surcharges,
+                    source=out.source,
+                )
             _SOP_CACHE[key] = out
             return SopParseResult(
                 sop_config=out,
@@ -131,6 +206,7 @@ def parse_sop(
                 sop_path=sop_path,
                 cached=False,
                 llm_usage=llm_usage,
+                llm_raw=parsed,
                 errors=errors,
             )
         except Exception as e:  # noqa: BLE001
@@ -166,6 +242,70 @@ def parse_sop(
     )
     _SOP_CACHE[key] = out
     return SopParseResult(sop_config=out, sop_loaded=True, sop_path=sop_path, cached=False, llm_usage=None, errors=[])
+
+
+def _merge_profile(*, primary: SopProfile, fallback: SopProfile) -> SopProfile:
+    customer_name = primary.customer_name or fallback.customer_name
+    match_emails = set(primary.match_emails) | set(fallback.match_emails)
+    match_domains = set(primary.match_domains) | set(fallback.match_domains)
+    match_domain_keywords = set(primary.match_domain_keywords) | set(fallback.match_domain_keywords)
+
+    allowed_modes = primary.allowed_modes if primary.allowed_modes else fallback.allowed_modes
+    margin_override = primary.margin_override if primary.margin_override is not None else fallback.margin_override
+
+    sea_discount_pct = primary.sea_discount_pct if primary.sea_discount_pct is not None else fallback.sea_discount_pct
+    if primary.sea_discount_pct is not None:
+        sea_discount_label = primary.sea_discount_label if primary.sea_discount_label is not None else fallback.sea_discount_label
+    else:
+        sea_discount_label = fallback.sea_discount_label
+
+    origin_required = primary.origin_required if primary.origin_required else fallback.origin_required
+
+    origin_fallbacks: dict[str, list[str]] = {}
+    for src in [fallback.origin_fallbacks, primary.origin_fallbacks]:
+        for loc, alts in (src or {}).items():
+            loc_key = str(loc).strip()
+            if not loc_key:
+                continue
+            origin_fallbacks.setdefault(loc_key, [])
+            for alt in alts or []:
+                alt_key = str(alt).strip()
+                if not alt_key:
+                    continue
+                if alt_key not in origin_fallbacks[loc_key]:
+                    origin_fallbacks[loc_key].append(alt_key)
+
+    transit_warning_if_gt_days = (
+        primary.transit_warning_if_gt_days
+        if primary.transit_warning_if_gt_days is not None
+        else fallback.transit_warning_if_gt_days
+    )
+    show_actual_and_chargeable_weight = bool(
+        primary.show_actual_and_chargeable_weight or fallback.show_actual_and_chargeable_weight
+    )
+    hide_margin_percent = bool(primary.hide_margin_percent or fallback.hide_margin_percent)
+    container_volume_discount_tiers = (
+        list(primary.container_volume_discount_tiers)
+        if primary.container_volume_discount_tiers
+        else list(fallback.container_volume_discount_tiers)
+    )
+
+    return SopProfile(
+        customer_name=customer_name,
+        match_emails=match_emails,
+        match_domains=match_domains,
+        match_domain_keywords=match_domain_keywords,
+        allowed_modes=allowed_modes,
+        margin_override=margin_override,
+        sea_discount_pct=sea_discount_pct,
+        sea_discount_label=sea_discount_label,
+        origin_required=origin_required,
+        origin_fallbacks=origin_fallbacks,
+        transit_warning_if_gt_days=transit_warning_if_gt_days,
+        show_actual_and_chargeable_weight=show_actual_and_chargeable_weight,
+        hide_margin_percent=hide_margin_percent,
+        container_volume_discount_tiers=container_volume_discount_tiers,
+    )
 
 
 def get_sop_profile(*, sop_config: SopConfig, sender_email: str) -> SopProfile | None:
@@ -266,6 +406,11 @@ def _build_sop_config_from_parsed(
     canonical_destinations: list[str],
 ) -> tuple[SopConfig, list[str]]:
     errors: list[str] = []
+
+    parsed = _normalize_llm_sop_payload(
+        parsed=parsed,
+        canonical_destinations=canonical_destinations,
+    )
 
     origin_lookup = _casefold_lookup(canonical_origins)
     destination_lookup = _casefold_lookup(canonical_destinations)
@@ -384,6 +529,200 @@ def _build_sop_config_from_parsed(
         global_rules.append(SopSurchargeRule(amount=float(amount), label=label, destination_canonical_in=dests))
 
     return SopConfig(profiles=profiles, global_surcharge_rules=global_rules, source="llm"), errors
+
+
+def _normalize_llm_sop_payload(*, parsed: dict[str, Any], canonical_destinations: list[str]) -> dict[str, Any]:
+    if isinstance(parsed.get("customers"), list) and isinstance(parsed.get("global_surcharges"), list):
+        return parsed
+
+    def key_norm(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+    def coerce_text_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(x).strip() for x in value if str(x).strip()]
+        if isinstance(value, dict):
+            items: list[tuple[Any, Any]] = list(value.items())
+
+            def sort_key(item: tuple[Any, Any]) -> tuple[int, Any]:
+                k = item[0]
+                try:
+                    return (0, int(k))
+                except (TypeError, ValueError):
+                    return (1, str(k))
+
+            items = sorted(items, key=sort_key)
+            return [str(v).strip() for _, v in items if str(v).strip()]
+        return []
+
+    def get_any(mapping: Any, *names: str) -> Any:
+        if not isinstance(mapping, dict) or not names:
+            return None
+        for name in names:
+            if name in mapping:
+                return mapping.get(name)
+        targets = {key_norm(n) for n in names}
+        for k, v in mapping.items():
+            if key_norm(k) in targets:
+                return v
+        return None
+
+    def get_ci(name: str) -> Any:
+        return get_any(parsed, name)
+
+    customer_specific_rules = get_ci("customer_specific_rules")
+    global_rules = get_ci("global_rules")
+    if not isinstance(customer_specific_rules, dict) and not isinstance(global_rules, dict):
+        customer_specific_rules = get_ci("customerSpecificRules")
+        global_rules = get_ci("globalRules")
+    if not isinstance(customer_specific_rules, dict) and not isinstance(global_rules, dict):
+        return parsed
+
+    out_customers: list[dict[str, Any]] = []
+    out_global_surcharges: list[dict[str, Any]] = []
+
+    if isinstance(customer_specific_rules, dict):
+        for raw_name, raw in customer_specific_rules.items():
+            if not isinstance(raw, dict):
+                continue
+            customer_name = str(raw.get("customer_name") or raw_name or "").strip()
+            if not customer_name:
+                continue
+
+            cust: dict[str, Any] = {"customer_name": customer_name}
+            email = get_any(raw, "email", "customer_email", "customerEmail")
+            if str(email or "").strip():
+                cust["match"] = {"emails": [str(email).strip()]}
+
+            rules = get_any(raw, "rules")
+            rules = rules if isinstance(rules, dict) else {}
+            mode = str(get_any(rules, "mode") or get_any(raw, "mode") or "").strip().casefold()
+            if mode in {"air", "sea"}:
+                cust["allowed_modes"] = [mode]
+
+            disc = _normalize_pct(get_any(raw, "discount", "discount_pct", "discountPct"))
+            if disc and disc > 0:
+                disc_mode: str | None = None
+                if isinstance(cust.get("allowed_modes"), list) and cust["allowed_modes"]:
+                    disc_mode = str(cust["allowed_modes"][0])
+                cust["discounts"] = [
+                    {
+                        "mode": disc_mode,
+                        "discount_pct": float(disc),
+                        "apply_before_margin": True,
+                        "label": None,
+                    }
+                ]
+
+            tiers: dict[int, float] = {}
+            discounts_obj = get_any(raw, "discounts")
+            if isinstance(discounts_obj, dict):
+                for k, v in discounts_obj.items():
+                    pct = _normalize_pct(v)
+                    if not pct or pct <= 0:
+                        continue
+                    m = re.search(r"(\d+)", str(k))
+                    if not m:
+                        continue
+                    th = _int_or_none(m.group(1))
+                    if not th:
+                        continue
+                    tiers[int(th)] = max(float(pct), float(tiers.get(int(th), 0.0)))
+            if tiers:
+                cust["container_volume_discount_tiers"] = [
+                    {"min_total_containers": int(th), "discount_pct": float(pct)} for th, pct in sorted(tiers.items(), key=lambda x: -x[0])
+                ]
+
+            locs = coerce_text_list(get_any(rules, "location_equivalence", "locationEquivalence", "locationEquivalenceList"))
+            if len(locs) >= 2:
+                cust["origin_equivalence_groups"] = [{"scope": "origin", "locations": locs}]
+
+            req_texts = coerce_text_list(get_any(rules, "output_requirements", "outputRequirements"))
+            if req_texts:
+                transit_warn = _infer_transit_warning_days(req_texts)
+                if transit_warn is not None:
+                    cust["transit_warning_if_gt_days"] = int(transit_warn)
+                if _infer_show_weights(req_texts):
+                    cust["show_actual_and_chargeable_weight"] = True
+                if any("subtotal" in t.casefold() for t in req_texts) or any("grand total" in t.casefold() for t in req_texts):
+                    cust["require_route_subtotals_and_grand_total"] = True
+
+            if bool(get_any(rules, "multi_route", "multiRoute")):
+                cust["require_route_subtotals_and_grand_total"] = True
+
+            out_customers.append(cust)
+
+    if isinstance(global_rules, dict):
+        au_dests = _australia_destinations(canonical_destinations)
+        for raw_name, raw in global_rules.items():
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw_name or raw.get("customer_name") or "").strip()
+            if not name:
+                continue
+
+            bio = _float_or_none(get_any(raw, "biosecurity_surcharge", "biosecuritySurcharge"))
+            if bio and bio > 0:
+                if au_dests:
+                    out_global_surcharges.append(
+                        {"amount": float(bio), "label": "Biosecurity surcharge (Australia)", "destination_canonical_in": au_dests}
+                    )
+                continue
+
+            cust: dict[str, Any] = {"customer_name": name}
+            margin = _normalize_pct(get_any(raw, "margin", "margin_override_pct", "marginOverridePct"))
+            if margin is not None:
+                cust["margin_override_pct"] = float(margin)
+            hide_margin = _bool_or_none(get_any(raw, "hide_margin", "hideMargin", "hide_margin_percent", "hideMarginPercent"))
+            if hide_margin is not None:
+                cust["hide_margin_percent"] = bool(hide_margin)
+            origin = str(get_any(raw, "origin", "originRestriction", "origin_required", "originRequired") or "").strip()
+            if origin:
+                cust["origin_required"] = [origin]
+            out_customers.append(cust)
+
+    return {"customers": out_customers, "global_surcharges": out_global_surcharges}
+
+
+def _infer_transit_warning_days(requirements: list[str]) -> int | None:
+    for text in requirements:
+        s = str(text or "").strip()
+        if not s:
+            continue
+        if "transit" not in s.casefold():
+            continue
+        m = re.search(r"(?i)exceed(?:s)?\s*(\d+)\s*day", s)
+        if m:
+            return _int_or_none(m.group(1))
+        m = re.search(r"(?i)(\d+)\s*day", s)
+        if m:
+            return _int_or_none(m.group(1))
+    return None
+
+
+def _infer_show_weights(requirements: list[str]) -> bool:
+    actual = False
+    chargeable = False
+    for text in requirements:
+        s = str(text or "").strip().casefold()
+        if not s:
+            continue
+        if "actual" in s and "weight" in s:
+            actual = True
+        if "chargeable" in s and "weight" in s:
+            chargeable = True
+        if "show" in s and "chargeable" in s and "actual" in s:
+            return True
+    return actual and chargeable
+
+
+def _australia_destinations(canonical_destinations: list[str]) -> list[str]:
+    australian_city_tokens = {"melbourne", "sydney", "brisbane", "perth", "adelaide"}
+    destinations = [str(d) for d in canonical_destinations if str(d).strip().casefold() in australian_city_tokens]
+    if destinations:
+        return destinations
+    melbourne = _pick_from_lookup("Melbourne", _casefold_lookup(canonical_destinations))
+    return [melbourne] if melbourne else []
 
 
 def _parse_sop_rule_based(
