@@ -12,6 +12,15 @@ from src.quote_logic import (
     lookup_easy_sea_rate,
 )
 from src.rate_sheets import NormalizedRateSheets, normalize_rate_sheets
+from src.llm_usage import sum_usage
+from src.sop import (
+    SopProfile,
+    get_global_surcharges,
+    get_sop_profile,
+    load_sop_markdown,
+    origin_fallbacks as sop_origin_fallbacks,
+    volume_discount_pct,
+)
 from src.trace import RunTrace
 
 
@@ -42,6 +51,7 @@ class RouteQuote:
     recommendation: str | None = None
     alternative: str | None = None
     notes: list[str] | None = None
+    warnings: list[str] | None = None
 
 
 def run_quote_pipeline(
@@ -51,6 +61,7 @@ def run_quote_pipeline(
     difficulty: str,
     use_openai: bool,
     rate_sheets: NormalizedRateSheets | None = None,
+    enable_sop: bool = False,
 ) -> PipelineResult:
     trace = RunTrace()
 
@@ -61,6 +72,31 @@ def run_quote_pipeline(
     )
 
     extraction = extract_requests(email=email, config=config, trace=trace, use_openai=use_openai)
+
+    sop_profile = get_sop_profile(email.sender) if enable_sop else None
+    sop_path = (config.data.data_dir / "SOP.md").resolve()
+    sop_loaded = bool(load_sop_markdown(data_dir=config.data.data_dir)) if enable_sop else False
+    trace.add(
+        "SOP",
+        summary="Applied customer-specific SOP rules." if enable_sop else "SOP disabled.",
+        data={
+            "enabled": enable_sop,
+            "sop_path": str(sop_path),
+            "sop_found": sop_path.exists(),
+            "sop_loaded": sop_loaded,
+            "customer_email": email.sender,
+            "matched_profile": {
+                "customer_name": sop_profile.customer_name,
+                "allowed_modes": sorted(list(sop_profile.allowed_modes)) if sop_profile and sop_profile.allowed_modes else None,
+                "margin_override": sop_profile.margin_override if sop_profile else None,
+                "sea_discount_pct": sop_profile.sea_discount_pct if sop_profile else None,
+                "container_volume_discount_tiers": sop_profile.container_volume_discount_tiers if sop_profile else None,
+                "origin_required": sorted(list(sop_profile.origin_required)) if sop_profile and sop_profile.origin_required else None,
+            }
+            if sop_profile
+            else None,
+        },
+    )
 
     if rate_sheets is None:
         rate_sheets = normalize_rate_sheets(config=config, difficulty=difficulty)
@@ -96,6 +132,9 @@ def run_quote_pipeline(
 
     merged_aliases = _merge_aliases(config.aliases, rate_sheets.aliases)
     merged_codes = {**rate_sheets.codes, **config.codes}
+    effective_margin = float(config.pricing.margin)
+    if enable_sop and sop_profile and sop_profile.margin_override is not None:
+        effective_margin = float(sop_profile.margin_override)
 
     trace.add(
         "Config Match",
@@ -104,7 +143,8 @@ def run_quote_pipeline(
             "data_dir": str(config.data.data_dir),
             "difficulty": difficulty,
             "rate_sheet": str(rate_sheets.source_path),
-            "margin": config.pricing.margin,
+            "margin_default": config.pricing.margin,
+            "margin_effective": effective_margin,
             "currency": config.pricing.currency,
             "air_volume_factor": config.pricing.air_volume_factor,
             "known_air_origins": air_origins,
@@ -125,8 +165,42 @@ def run_quote_pipeline(
     )
 
     clarifications: list[str] = list(extraction.clarification_questions)
+    container_discount_pct = 0.0
+    container_discount_label: str | None = None
+    container_qty_estimates: list[int | None] = [None] * len(extraction.shipments)
+    total_containers_estimate = 0
+    if enable_sop and sop_profile and sop_profile.container_volume_discount_tiers:
+        missing_container_counts = False
+        for idx, sh in enumerate(extraction.shipments):
+            if sh.mode != "sea":
+                continue
+            qty = sh.quantity
+            if qty is None and sh.volume_cbm is not None:
+                qty = recommend_containers(float(sh.volume_cbm)).recommended_quantity
+            if qty is None:
+                missing_container_counts = True
+            else:
+                qty_int = int(qty)
+                container_qty_estimates[idx] = qty_int
+                total_containers_estimate += qty_int
+
+        container_discount_pct = volume_discount_pct(sop_profile, total_containers=total_containers_estimate)
+        if container_discount_pct > 0:
+            container_discount_label = (
+                f"{int(container_discount_pct * 100)}% volume discount ({total_containers_estimate} containers total)"
+            )
+        if missing_container_counts:
+            clarifications.append("Please confirm total container quantities across all routes so we can apply your volume discount.")
     quotes: list[RouteQuote] = []
-    for shipment in extraction.shipments:
+    for shipment_idx, shipment in enumerate(extraction.shipments):
+        if enable_sop and sop_profile and sop_profile.allowed_modes and shipment.mode not in sop_profile.allowed_modes:
+            allowed = " / ".join(
+                ["air freight" if m == "air" else "sea freight" for m in sorted(sop_profile.allowed_modes)]
+            )
+            clarifications.append(
+                f"Per your SOP ({sop_profile.customer_name}), we can quote {allowed} only. Please confirm if you'd like a {allowed} quote."
+            )
+            continue
         if shipment.mode == "air":
             origin_res = _resolve(
                 raw=shipment.origin_raw,
@@ -142,10 +216,13 @@ def run_quote_pipeline(
                 use_openai=use_openai,
                 aliases=merged_aliases,
             )
+            loc_llm_usage = sum_usage([origin_res.llm_usage, dest_res.llm_usage], model=config.openai.model)
             trace.add(
                 "Normalize Locations (Air)",
                 summary="Resolved origin/destination for air shipment.",
                 data={"origin": asdict(origin_res), "destination": asdict(dest_res)},
+                used_llm=bool(loc_llm_usage),
+                llm_usage=loc_llm_usage,
             )
 
             missing_location = False
@@ -179,7 +256,15 @@ def run_quote_pipeline(
                 continue
 
             trace.add("Rate Lookup (Air)", summary="Matched air rate row.", data=asdict(rate))
-            amounts = compute_quote_amounts(request=shipment, rate=rate, config=config)
+            surcharges = get_global_surcharges(destination_canonical=dest_res.canonical) if enable_sop else []
+            surcharge_total = sum(float(s.amount) for s in surcharges)
+            amounts = compute_quote_amounts(
+                request=shipment,
+                rate=rate,
+                config=config,
+                margin_override=effective_margin if enable_sop else None,
+                surcharge=surcharge_total,
+            )
             trace.add("Calculate Quote (Air)", summary="Computed chargeable weight and price.", data=amounts)
 
             final_amount = float(round(float(amounts["final_amount"])))
@@ -190,6 +275,21 @@ def run_quote_pipeline(
             notes: list[str] = []
             if shipment.actual_weight_kg is not None and chargeable > float(shipment.actual_weight_kg) + 0.1:
                 notes.append("volumetric")
+            if enable_sop and surcharges:
+                for s in surcharges:
+                    notes.append(f"Surcharge: ${int(round(float(s.amount))):,} {s.label}")
+
+            warnings: list[str] = []
+            if (
+                enable_sop
+                and sop_profile
+                and sop_profile.transit_warning_if_gt_days is not None
+                and rate.transit_days is not None
+                and rate.transit_days > int(sop_profile.transit_warning_if_gt_days)
+            ):
+                warnings.append(
+                    f"Transit time is {int(rate.transit_days)} days (exceeds {int(sop_profile.transit_warning_if_gt_days)} days)."
+                )
 
             quotes.append(
                 RouteQuote(
@@ -206,6 +306,7 @@ def run_quote_pipeline(
                     volume_cbm=shipment.volume_cbm,
                     commodity=shipment.commodity,
                     notes=notes or None,
+                    warnings=warnings or None,
                 )
             )
             continue
@@ -225,10 +326,13 @@ def run_quote_pipeline(
                 use_openai=use_openai,
                 aliases=merged_aliases,
             )
+            loc_llm_usage = sum_usage([origin_res.llm_usage, dest_res.llm_usage], model=config.openai.model)
             trace.add(
                 "Normalize Locations (Sea)",
                 summary="Resolved origin/destination for sea shipment.",
                 data={"origin": asdict(origin_res), "destination": asdict(dest_res)},
+                used_llm=bool(loc_llm_usage),
+                llm_usage=loc_llm_usage,
             )
 
             missing_location = False
@@ -246,6 +350,15 @@ def run_quote_pipeline(
                 missing_location = True
             if missing_location:
                 continue
+
+            if enable_sop and sop_profile and sop_profile.origin_required:
+                required = {x.strip() for x in sop_profile.origin_required if x.strip()}
+                if not origin_res.canonical or origin_res.canonical not in required:
+                    allowed = " / ".join(sorted(required))
+                    clarifications.append(
+                        f"Per your SOP ({sop_profile.customer_name}), origin must be {allowed}. Please confirm the origin."
+                    )
+                    continue
 
             effective = shipment
             fit_note: str | None = None
@@ -271,29 +384,89 @@ def run_quote_pipeline(
                     if rec.alternative:
                         alt_size = int(rec.alternative["size_ft"])
                         alt_qty = int(rec.alternative["quantity"])
-                        alt_rate = lookup_easy_sea_rate(
+                        alt_discount_pct = 0.0
+                        alt_discount_label: str | None = None
+                        if enable_sop and sop_profile and sop_profile.container_volume_discount_tiers:
+                            base_qty = container_qty_estimates[shipment_idx]
+                            if base_qty is not None:
+                                alt_total_containers = int(total_containers_estimate) - int(base_qty) + int(alt_qty)
+                                alt_discount_pct = volume_discount_pct(sop_profile, total_containers=alt_total_containers)
+                                if alt_discount_pct > 0:
+                                    alt_discount_label = (
+                                        f"{int(alt_discount_pct * 100)}% volume discount ({alt_total_containers} containers total)"
+                                    )
+
+                        alt_rate, _, _ = _lookup_sea_rate_with_sop(
                             df_sea=df_sea,
                             origin=origin_res.canonical,
                             destination=dest_res.canonical,
                             container_size_ft=alt_size,
                             currency=config.pricing.currency,
+                            sop_profile=sop_profile if enable_sop else None,
                         )
                         if alt_rate:
-                            alt_per = round(float(alt_rate.base_rate) * (1.0 + config.pricing.margin))
-                            alt_total = round(float(alt_rate.base_rate) * alt_qty * (1.0 + config.pricing.margin))
-                            alternative = f"{alt_qty} x {alt_size}ft @ ${int(alt_per):,} each = ${int(alt_total):,} total"
+                            surcharges = get_global_surcharges(destination_canonical=dest_res.canonical) if enable_sop else []
+                            surcharge_total = sum(float(s.amount) for s in surcharges)
+                            alt_effective = ShipmentRequest(
+                                mode="sea",
+                                origin_raw=shipment.origin_raw,
+                                destination_raw=shipment.destination_raw,
+                                quantity=alt_qty,
+                                container_size_ft=alt_size,
+                                volume_cbm=shipment.volume_cbm,
+                                commodity=shipment.commodity,
+                                notes=shipment.notes,
+                            )
+
+                            discount_pct = 0.0
+                            if enable_sop and sop_profile:
+                                if sop_profile.sea_discount_pct:
+                                    discount_pct = float(sop_profile.sea_discount_pct)
+                                elif alt_discount_pct > 0:
+                                    discount_pct = float(alt_discount_pct)
+                                elif container_discount_pct > 0:
+                                    discount_pct = float(container_discount_pct)
+
+                            alt_amounts = compute_quote_amounts(
+                                request=alt_effective,
+                                rate=alt_rate,
+                                config=config,
+                                margin_override=effective_margin if enable_sop else None,
+                                discount_pct=discount_pct,
+                                surcharge=surcharge_total,
+                            )
+                            alt_subtotal = float(round(float(alt_amounts["final_amount_before_surcharge"])))
+                            alt_discount = float(alt_amounts.get("discount_pct") or 0.0)
+                            alt_margin = float(alt_amounts.get("margin") or config.pricing.margin)
+                            alt_per = float(round(float(alt_rate.base_rate) * (1.0 - alt_discount) * (1.0 + alt_margin)))
+                            alt_total = float(round(float(alt_amounts["final_amount"])))
+
+                            suffix = ""
+                            if enable_sop and alt_discount_label:
+                                suffix += f" ({alt_discount_label})"
+                            if enable_sop and surcharges:
+                                surcharge_label = ", ".join([f"${int(round(float(s.amount))):,} {s.label}" for s in surcharges])
+                                suffix += f" (+{surcharge_label} = {_format_money(alt_total)} total)"
+
+                            if enable_sop and surcharges:
+                                alternative = (
+                                    f"{alt_qty} x {alt_size}ft @ {_format_money(alt_per)} each = {_format_money(alt_subtotal)} subtotal{suffix}"
+                                )
+                            else:
+                                alternative = f"{alt_qty} x {alt_size}ft @ {_format_money(alt_per)} each = {_format_money(alt_subtotal)} total{suffix}"
                 else:
                     clarifications.append(
                         f"For sea freight {origin_res.canonical} -> {dest_res.canonical}, please confirm container size (20ft/40ft) and quantity."
                     )
                     continue
 
-            rate = lookup_easy_sea_rate(
+            rate, origin_used, origin_fallback_note = _lookup_sea_rate_with_sop(
                 df_sea=df_sea,
                 origin=origin_res.canonical,
                 destination=dest_res.canonical,
                 container_size_ft=int(effective.container_size_ft or 0),
                 currency=config.pricing.currency,
+                sop_profile=sop_profile if enable_sop else None,
             )
             if not rate:
                 trace.add(
@@ -310,14 +483,55 @@ def run_quote_pipeline(
                 )
                 continue
 
-            trace.add("Rate Lookup (Sea)", summary="Matched sea rate row.", data=asdict(rate))
-            amounts = compute_quote_amounts(request=effective, rate=rate, config=config)
+            lookup_data = asdict(rate)
+            if origin_used != origin_res.canonical:
+                lookup_data["origin_equivalence"] = {"requested": origin_res.canonical, "matched": origin_used}
+            trace.add(
+                "Rate Lookup (Sea)",
+                summary="Matched sea rate row." if origin_used == origin_res.canonical else "Matched sea rate row (SOP origin equivalence applied).",
+                data=lookup_data,
+            )
+
+            discount_pct = 0.0
+            discount_note: str | None = None
+            if enable_sop and sop_profile:
+                if sop_profile.sea_discount_pct:
+                    discount_pct = float(sop_profile.sea_discount_pct)
+                    discount_note = sop_profile.sea_discount_label or f"{int(discount_pct * 100)}% discount"
+                elif container_discount_pct > 0:
+                    discount_pct = float(container_discount_pct)
+                    discount_note = container_discount_label
+
+            surcharges = get_global_surcharges(destination_canonical=dest_res.canonical) if enable_sop else []
+            surcharge_total = sum(float(s.amount) for s in surcharges)
+
+            amounts = compute_quote_amounts(
+                request=effective,
+                rate=rate,
+                config=config,
+                margin_override=effective_margin if enable_sop else None,
+                discount_pct=discount_pct,
+                surcharge=surcharge_total,
+            )
             trace.add("Calculate Quote (Sea)", summary="Computed total price.", data=amounts)
 
             final_amount = float(round(float(amounts["final_amount"])))
-            per_container = float(round(float(rate.base_rate) * (1.0 + config.pricing.margin)))
+            discount_used = float(amounts.get("discount_pct") or 0.0)
+            margin_used = float(amounts.get("margin") or config.pricing.margin)
+            per_container = float(round(float(rate.base_rate) * (1.0 - discount_used) * (1.0 + margin_used)))
             o_disp = _display_location(origin_res, codes=merged_codes, show_code=False)
             d_disp = _display_location(dest_res, codes=merged_codes, show_code=False)
+
+            notes_out: list[str] = []
+            if fit_note:
+                notes_out.append(fit_note)
+            if origin_fallback_note:
+                notes_out.append(origin_fallback_note)
+            if enable_sop and discount_note:
+                notes_out.append(f"Discount applied: {discount_note}")
+            if enable_sop and surcharges:
+                for s in surcharges:
+                    notes_out.append(f"Surcharge: ${int(round(float(s.amount))):,} {s.label}")
 
             quotes.append(
                 RouteQuote(
@@ -336,7 +550,7 @@ def run_quote_pipeline(
                     commodity=shipment.commodity,
                     recommendation=recommendation,
                     alternative=alternative,
-                    notes=[fit_note] if fit_note else None,
+                    notes=notes_out or None,
                 )
             )
             continue
@@ -356,9 +570,51 @@ def run_quote_pipeline(
         trace.add("Clarification Required", summary="Missing information prevents quoting.", data={"questions": clarifications})
         return PipelineResult(quote_text=_format_clarification_response(email=email, questions=clarifications), trace=trace)
 
-    quote_text = _format_quotes(quotes=quotes, clarifications=clarifications, config=config)
+    quote_body = _format_quotes(quotes=quotes, clarifications=clarifications, config=config)
+    quote_text = (
+        _format_quote_email_reply(email=email, quote_body=quote_body, sop_profile=sop_profile)
+        if enable_sop
+        else quote_body
+    )
     trace.add("Format Response", summary="Generated formatted quote text.")
     return PipelineResult(quote_text=quote_text, trace=trace)
+
+
+def _lookup_sea_rate_with_sop(
+    *,
+    df_sea,
+    origin: str,
+    destination: str,
+    container_size_ft: int,
+    currency: str,
+    sop_profile: SopProfile | None,
+):
+    rate = lookup_easy_sea_rate(
+        df_sea=df_sea,
+        origin=origin,
+        destination=destination,
+        container_size_ft=container_size_ft,
+        currency=currency,
+    )
+    if rate:
+        return rate, origin, None
+
+    if not sop_profile:
+        return None, origin, None
+
+    for alt_origin in sop_origin_fallbacks(sop_profile, origin_canonical=origin):
+        alt_rate = lookup_easy_sea_rate(
+            df_sea=df_sea,
+            origin=alt_origin,
+            destination=destination,
+            container_size_ft=container_size_ft,
+            currency=currency,
+        )
+        if alt_rate:
+            note = f"Origin equivalence applied: matched using {alt_origin} per SOP."
+            return alt_rate, alt_origin, note
+
+    return None, origin, None
 
 
 def _resolve(
@@ -414,6 +670,32 @@ def _format_clarification_response(*, email: EmailMessage, questions: list[str])
     return "\n".join(lines)
 
 
+def _format_money(amount: float) -> str:
+    value = float(amount)
+    nearest_int = round(value)
+    if abs(value - nearest_int) < 1e-6:
+        return f"${int(nearest_int):,}"
+    return f"${value:,.2f}"
+
+
+def _format_quote_email_reply(*, email: EmailMessage, quote_body: str, sop_profile: SopProfile | None) -> str:
+    greeting = "Hi,"
+    intro = "Thank you for your inquiry. Please find our quote below."
+    if sop_profile:
+        intro = f"Thank you for your inquiry. We have applied your SOP ({sop_profile.customer_name}). Please find our quote below."
+
+    lines: list[str] = [
+        greeting,
+        "",
+        intro,
+        "",
+        quote_body.strip(),
+        "",
+        "Best regards,",
+    ]
+    return "\n".join(lines).strip() + "\n"
+
+
 def _format_quotes(*, quotes: list[RouteQuote], clarifications: list[str], config: AppConfig) -> str:
     if len(quotes) == 1:
         return _format_single_quote(quotes[0], clarifications=clarifications, config=config)
@@ -428,9 +710,17 @@ def _format_single_quote(q: RouteQuote, *, clarifications: list[str], config: Ap
             lines.append(f"Actual: {int(q.actual_weight_kg)} kg | Volume: {q.volume_cbm:g} CBM")
         suffix = " (volumetric)" if q.notes and "volumetric" in q.notes else ""
         lines.append(f"Chargeable weight: {int(q.chargeable_weight_kg or 0)} kg{suffix}")
-        lines.append(f"Rate: ${int(q.final_amount):,} {q.currency}")
+        lines.append(f"Rate: {_format_money(q.final_amount)} {q.currency}")
         if q.transit_days is not None:
             lines.append(f"Transit: {q.transit_days} days")
+        if q.warnings:
+            for warning in q.warnings:
+                lines.append(f"Warning: {warning}")
+        if q.notes:
+            for note in q.notes:
+                if note.strip().casefold() == "volumetric":
+                    continue
+                lines.append(f"Note: {note}")
     else:
         qty = int(q.quantity or 0)
         size = int(q.container_size_ft or 0)
@@ -444,12 +734,15 @@ def _format_single_quote(q: RouteQuote, *, clarifications: list[str], config: Ap
         if not q.recommendation:
             lines.append(f"{qty} x {size}ft container" if qty == 1 else f"{qty} x {size}ft containers")
         if qty > 1 and q.per_container_amount is not None:
-            lines.append(f"Rate: ${int(q.per_container_amount):,} per container")
-            lines.append(f"Total: ${int(q.final_amount):,} {q.currency}")
+            lines.append(f"Rate: {_format_money(q.per_container_amount)} per container")
+            lines.append(f"Total: {_format_money(q.final_amount)} {q.currency}")
         else:
-            lines.append(f"Rate: ${int(q.final_amount):,} {q.currency}")
+            lines.append(f"Rate: {_format_money(q.final_amount)} {q.currency}")
         if q.transit_days is not None:
             lines.append(f"Transit: {q.transit_days} days")
+        if q.warnings:
+            for warning in q.warnings:
+                lines.append(f"Warning: {warning}")
         if q.notes:
             for note in q.notes:
                 lines.append(f"Note: {note}")
@@ -475,24 +768,37 @@ def _format_multi_route(quotes: list[RouteQuote], *, clarifications: list[str], 
             lines.append(f"  {qty} x {size}ft container" if qty == 1 else f"  {qty} x {size}ft containers")
             if q.per_container_amount is not None:
                 if qty > 1:
-                    lines.append(f"  Rate: ${int(q.per_container_amount):,} per container")
+                    lines.append(f"  Rate: {_format_money(q.per_container_amount)} per container")
                 else:
-                    lines.append(f"  Rate: ${int(q.per_container_amount):,}")
-            lines.append(f"  Subtotal: ${int(q.final_amount):,}")
+                    lines.append(f"  Rate: {_format_money(q.per_container_amount)}")
+            lines.append(f"  Subtotal: {_format_money(q.final_amount)}")
             if q.transit_days is not None:
                 lines.append(f"  Transit: {q.transit_days} days")
+            if q.warnings:
+                for warning in q.warnings:
+                    lines.append(f"  Warning: {warning}")
             if q.notes:
                 for note in q.notes:
                     lines.append(f"  Note: {note}")
         else:
             lines.append(f"  Air Freight: {int(q.chargeable_weight_kg or 0)} kg chargeable")
-            lines.append(f"  Subtotal: ${int(q.final_amount):,}")
+            if q.actual_weight_kg is not None and q.volume_cbm is not None:
+                lines.append(f"  Actual: {int(q.actual_weight_kg)} kg | Volume: {q.volume_cbm:g} CBM")
+            lines.append(f"  Subtotal: {_format_money(q.final_amount)}")
             if q.transit_days is not None:
                 lines.append(f"  Transit: {q.transit_days} days")
+            if q.warnings:
+                for warning in q.warnings:
+                    lines.append(f"  Warning: {warning}")
+            if q.notes:
+                for note in q.notes:
+                    if note.strip().casefold() == "volumetric":
+                        continue
+                    lines.append(f"  Note: {note}")
         lines.append("")
         grand_total += q.final_amount
 
-    lines.append(f"GRAND TOTAL: ${int(round(grand_total)):,} {config.pricing.currency}")
+    lines.append(f"GRAND TOTAL: {_format_money(grand_total)} {config.pricing.currency}")
 
     if clarifications:
         lines.append("")

@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import difflib
 import re
+from typing import Any
 
 from openai import OpenAI
 
 from src.config import AppConfig
+from src.llm_usage import usage_from_response
+from src.prompts import LOCATION_MATCH_SYSTEM_PROMPT, location_match_user_prompt
 
 
 _IATA_RE = re.compile(r"\(([A-Z]{3})\)")
@@ -19,6 +22,7 @@ class LocationResolution:
     extracted_code: str | None
     method: str
     score: float | None = None
+    llm_usage: dict[str, Any] | None = None
 
 
 def clean_text(text: str) -> str:
@@ -81,12 +85,19 @@ def resolve_location(
     if cleaned in by_clean:
         return LocationResolution(raw=raw, canonical=by_clean[cleaned], extracted_code=extracted_code, method="exact", score=1.0)
 
+    tokens = {t for t in cleaned.split() if t}
     for canonical, alias_list in aliases.items():
         for alias in [canonical, *alias_list]:
             alias_clean = clean_text(alias)
             if not alias_clean:
                 continue
-            if alias_clean in cleaned or cleaned in alias_clean:
+            if not cleaned:
+                continue
+            if len(alias_clean) <= 3:
+                matched = alias_clean in tokens
+            else:
+                matched = alias_clean in cleaned or cleaned in alias_clean
+            if matched:
                 if canonical in known_locations:
                     return LocationResolution(
                         raw=raw,
@@ -114,7 +125,7 @@ def resolve_location(
 
     if use_openai and config.openai.api_key and known_locations:
         try:
-            canonical = _llm_pick_location(raw=raw, choices=known_locations, config=config)
+            canonical, llm_usage = _llm_pick_location(raw=raw, choices=known_locations, config=config)
             if canonical in known_locations:
                 return LocationResolution(
                     raw=raw,
@@ -122,22 +133,27 @@ def resolve_location(
                     extracted_code=extracted_code,
                     method="llm",
                     score=None,
+                    llm_usage=llm_usage,
                 )
+            return LocationResolution(
+                raw=raw,
+                canonical=None,
+                extracted_code=extracted_code,
+                method="llm",
+                score=best_score or None,
+                llm_usage=llm_usage,
+            )
         except Exception:
             pass
 
     return LocationResolution(raw=raw, canonical=None, extracted_code=extracted_code, method="unmatched", score=best_score or None)
 
 
-def _llm_pick_location(*, raw: str, choices: list[str], config: AppConfig) -> str:
+def _llm_pick_location(*, raw: str, choices: list[str], config: AppConfig) -> tuple[str, dict[str, Any]]:
     client = OpenAI(api_key=config.openai.api_key)
 
-    system = (
-        "You map a raw location string to the best matching canonical location.\n"
-        "Return ONLY JSON: {\"canonical\": \"...\"}\n"
-        "If none matches, return {\"canonical\": null}."
-    )
-    user = f"RAW:\n{raw}\n\nCHOICES:\n" + "\n".join(f"- {c}" for c in choices)
+    system = LOCATION_MATCH_SYSTEM_PROMPT
+    user = location_match_user_prompt(raw=raw, choices=choices)
 
     kwargs = dict(
         model=config.openai.model,
@@ -153,13 +169,14 @@ def _llm_pick_location(*, raw: str, choices: list[str], config: AppConfig) -> st
     except TypeError:
         resp = client.chat.completions.create(**kwargs)
 
+    llm_usage = usage_from_response(resp, model=config.openai.model, calls=1)
     content = resp.choices[0].message.content or ""
     m = re.search(r"\{.*\}", content, flags=re.DOTALL)
     if not m:
-        return ""
+        return "", llm_usage
     data = json_loads_safe(m.group(0))
     canonical = data.get("canonical")
-    return str(canonical) if canonical else ""
+    return (str(canonical) if canonical else ""), llm_usage
 
 
 def json_loads_safe(text: str) -> dict:

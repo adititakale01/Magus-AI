@@ -15,7 +15,7 @@ And runs a step-by-step quote pipeline (with a visible trace) to produce a forma
 python -m pip install --user -r "hackathon 2/demo_web_gui/requirements.txt"
 ```
 
-2) Create `hackathon 2/demo_web_gui/.env` (copy from `.env.example`) and add your OpenAI API key:
+2) Add your OpenAI API key in `hackathon 2/demo_web_gui/.env`:
 ```
 OPENAI_API_KEY=...
 ```

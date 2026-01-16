@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import re
+import time
 
 import streamlit as st
 
@@ -69,6 +72,11 @@ def main() -> None:
             value=True,
             help="If disabled (or no API key), a rule-based extractor is used.",
         )
+        enable_sop = st.toggle(
+            "Enable SOP rules (`SOP.md`)",
+            value=False,
+            help="Applies customer-specific SOP overrides (mode restrictions, discounts, surcharges, formatting).",
+        )
 
         st.divider()
         st.subheader("OpenAI")
@@ -81,6 +89,8 @@ def main() -> None:
         st.subheader("Data")
         st.write(f"Data dir: `{config.data.data_dir}`")
         st.write(f"Emails: **{len(email_index)}**")
+        sop_path = (config.data.data_dir / "SOP.md").resolve()
+        st.write("SOP: " + ("found" if sop_path.exists() else "missing") + f" (`{sop_path}`)")
         st.markdown("**Rate sheets**")
         for diff in ["easy", "medium", "hard"]:
             st.write(f"- {diff.title()}: `{paths[diff]}`" + (" (found)" if paths[diff].exists() else " (missing)"))
@@ -148,7 +158,52 @@ def main() -> None:
 
     with col_left:
         st.subheader("1) Select an Email")
-        email_id = st.selectbox("Email", options=sorted(email_index.keys()))
+        with st.expander("Create & save a custom email", expanded=False):
+            emails_dir = (config.data.data_dir / "emails").resolve()
+            st.caption(f"Saves to: `{emails_dir}`")
+
+            if "custom_email_id" not in st.session_state:
+                st.session_state["custom_email_id"] = "email_custom_01"
+
+            def _sanitize_email_stem(raw: str) -> str:
+                s = re.sub(r"[^a-zA-Z0-9_]+", "_", str(raw or "").strip()).strip("_")
+                if not s:
+                    s = f"email_custom_{int(time.time())}"
+                if not s.casefold().startswith("email_"):
+                    s = f"email_{s}"
+                return s
+
+            custom_email_id = st.text_input(
+                "Email ID (filename stem, must start with `email_`)",
+                key="custom_email_id",
+                help="Will be saved as `email_*.json` so it appears in the dropdown.",
+            )
+            custom_from = st.text_input("From", value="user@example.com", key="custom_from")
+            custom_to = st.text_input("To", value="quotes@freightco.com", key="custom_to")
+            custom_subject = st.text_input("Subject", value="Custom quote request", key="custom_subject")
+            custom_body = st.text_area("Body", value="", height=180, key="custom_body")
+            overwrite = st.toggle("Overwrite if file exists", value=False, key="custom_overwrite")
+
+            save_btn = st.button("Save email to local folder", type="secondary", key="save_custom_email")
+            if save_btn:
+                stem = _sanitize_email_stem(custom_email_id)
+                emails_dir.mkdir(parents=True, exist_ok=True)
+                path = (emails_dir / f"{stem}.json").resolve()
+                if path.exists() and not overwrite:
+                    st.error(f"File already exists: `{path}` (enable overwrite to replace).")
+                else:
+                    payload = {
+                        "from": str(custom_from or "").strip(),
+                        "to": str(custom_to or "").strip(),
+                        "subject": str(custom_subject or "").strip(),
+                        "body": str(custom_body or "").strip(),
+                    }
+                    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                    st.success(f"Saved: `{path}`")
+                    st.session_state["selected_email_id"] = stem
+                    st.rerun()
+
+        email_id = st.selectbox("Email", options=sorted(email_index.keys()), key="selected_email_id")
         email = load_email(email_index[email_id])
 
         st.markdown("**Subject**")
@@ -157,19 +212,40 @@ def main() -> None:
         st.markdown("**Body**")
         st.code(email.body, language="text")
 
+        sol_path = (config.data.data_dir / "solutions" / f"solution_{email_id}.md").resolve()
+        with st.expander("Standard answer (ground truth)", expanded=False):
+            if sol_path.exists():
+                st.markdown(sol_path.read_text(encoding="utf-8", errors="replace"))
+            else:
+                st.info(f"No solution file found at `{sol_path}`")
+
         run_btn = st.button("Run Quote Pipeline", type="primary", disabled=selected_rates is None)
 
     with col_right:
         st.subheader("2) Output")
         if run_btn and selected_rates is not None:
             with st.spinner("Running pipeline..."):
+                t0 = time.perf_counter()
                 result = run_quote_pipeline(
                     email=email,
                     config=config,
                     difficulty=difficulty,
                     use_openai=use_openai,
                     rate_sheets=selected_rates,
+                    enable_sop=enable_sop,
                 )
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+            st.markdown("**Run metrics**")
+            st.write(f"Latency: {elapsed_ms:.0f} ms")
+            st.write(
+                {
+                    "llm_calls": result.trace.llm_usage.calls,
+                    "prompt_tokens": result.trace.llm_usage.prompt_tokens,
+                    "completion_tokens": result.trace.llm_usage.completion_tokens,
+                    "total_tokens": result.trace.llm_usage.total_tokens,
+                }
+            )
 
             if result.error:
                 st.error(result.error)
@@ -179,9 +255,22 @@ def main() -> None:
 
             st.markdown("**Trace (steps + artifacts)**")
             for step in result.trace.steps:
-                with st.expander(step.title, expanded=False):
+                marker = "LLM" if step.used_llm else "local"
+                with st.expander(f"[{marker}] {step.title}", expanded=False):
                     if step.summary:
                         st.caption(step.summary)
+                    if step.llm_usage:
+                        st.caption(
+                            "LLM usage: "
+                            + ", ".join(
+                                [
+                                    f"calls={step.llm_usage.get('calls')}",
+                                    f"prompt={step.llm_usage.get('prompt_tokens')}",
+                                    f"completion={step.llm_usage.get('completion_tokens')}",
+                                    f"total={step.llm_usage.get('total_tokens')}",
+                                ]
+                            )
+                        )
                     if step.data is not None:
                         st.json(step.data)
 
