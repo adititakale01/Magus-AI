@@ -25,6 +25,15 @@ OPENAI_API_KEY=...
 python -m streamlit run "hackathon 2/demo_web_gui/app.py"
 ```
 
+## API server (for frontend integration)
+Run from the `hackathon 2/demo_web_gui/` folder:
+```bash
+python -m uvicorn api_server:app --host 0.0.0.0 --port 8000
+```
+
+- API docs: `hackathon 2/demo_web_gui/API.md`
+- Base URL: `http://localhost:8000/api/v1`
+
 ## Pages
 - **Freight Quote Agent Demo**: pick an email and run the pipeline with a full trace.
 - **Workflow & Methodology**: explains the end-to-end flow and includes a batch validation runner.
