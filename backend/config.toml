@@ -1,0 +1,61 @@
+[data]
+# Path is relative to this demo folder.
+data_dir = "../hackathon_data"
+
+[rates]
+easy_file = "rate_sheets/01_rates_easy.xlsx"
+medium_file = "rate_sheets/02_rates_medium.xlsx"
+hard_file = "rate_sheets/03_rates_hard.xlsx"
+
+[pricing]
+margin = 0.15
+currency = "USD"
+air_volume_factor = 167.0
+
+[openai]
+model = "gpt-4.1-mini"
+temperature = 0
+
+[aliases]
+"Shanghai" = ["SHANGHAI", "PVG", "SHA", "CNSHA", "SHANG HAI", "SHANG-HAI"]
+"Ningbo" = ["NINGBO", "NGB", "CNNBG"]
+"Shenzhen" = ["SHENZHEN", "SZX", "SHEKOU", "SZ", "SHEN ZHEN"]
+"Ho Chi Minh City" = ["HO CHI MINH", "HO CHI MINH CITY", "HCMC", "SAIGON", "SGN", "HOCHIMINH"]
+"Busan" = ["BUSAN", "PUSAN", "PUS"]
+"Qingdao" = ["QINGDAO", "TSINGTAO", "TAO"]
+"Manzanillo" = ["MANZANILLO", "MANZANILLO MX", "MANZANILLO (MX)", "MZT"]
+"Rotterdam" = ["ROTTERDAM", "RTM"]
+"Hamburg" = ["HAMBURG", "HAM"]
+"Felixstowe" = ["FELIXSTOWE", "FXT"]
+"Los Angeles" = ["LOS ANGELES", "LA", "LAX", "LONG BEACH", "LB"]
+"Melbourne" = ["MELBOURNE", "MEL"]
+"Yokohama" = ["YOKOHAMA", "YOK", "TOKYO", "TOKYO/YOKOHAMA"]
+"Gdansk" = ["GDANSK", "GDYNIA", "GDANSK/GDYNIA", "GDN"]
+"San Francisco" = ["SAN FRANCISCO", "SF", "SFO"]
+"Frankfurt" = ["FRANKFURT", "FRA"]
+"Mumbai" = ["MUMBAI", "BOMBAY", "BOM"]
+"Chicago" = ["CHICAGO", "CHI", "ORD"]
+"Tokyo" = ["TOKYO", "NARITA", "NRT", "TYO"]
+"Paris" = ["PARIS", "CDG"]
+
+[codes]
+"Shanghai" = "SHA"
+"Ningbo" = "NGB"
+"Shenzhen" = "SZX"
+"Ho Chi Minh City" = "SGN"
+"Busan" = "PUS"
+"Qingdao" = "TAO"
+"Manzanillo" = "MZT"
+"Rotterdam" = "RTM"
+"Hamburg" = "HAM"
+"Felixstowe" = "FXT"
+"Los Angeles" = "LAX"
+"Melbourne" = "MEL"
+"Yokohama" = "YOK"
+"Gdansk" = "GDN"
+"San Francisco" = "SFO"
+"Frankfurt" = "FRA"
+"Mumbai" = "BOM"
+"Chicago" = "ORD"
+"Tokyo" = "NRT"
+"Paris" = "CDG"

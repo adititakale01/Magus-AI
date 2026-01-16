@@ -1,0 +1,169 @@
+{
+    "Shanghai": {
+        "code": "SHA",
+        "country": "China",
+        "aliases": [
+            "SHANGHAI", "PVG", "SHA", "CNSHA",
+            "SHANG HAI", "SHANG-HAI"
+        ]
+    },
+
+    "Ningbo": {
+        "code": "NGB",
+        "country": "China",
+        "aliases": [
+            "NINGBO", "NGB", "CNNBG"
+        ]
+    },
+
+    "Shenzhen": {
+        "code": "SZX",
+        "country": "China",
+        "aliases": [
+            "SHENZHEN", "SZX", "SHEKOU",
+            "SZ", "SHEN ZHEN"
+        ]
+    },
+
+    "Ho Chi Minh City": {
+        "code": "SGN",
+        "country": "Vietnam",
+        "aliases": [
+            "HO CHI MINH", "HO CHI MINH CITY",
+            "HCMC", "SAIGON", "SGN", "HOCHIMINH"
+        ]
+    },
+
+    "Busan": {
+        "code": "PUS",
+        "country": "South Korea",
+        "aliases": [
+            "BUSAN", "PUSAN", "PUS"
+        ]
+    },
+
+    "Qingdao": {
+        "code": "TAO",
+        "country": "China",
+        "aliases": [
+            "QINGDAO", "TSINGTAO", "TAO"
+        ]
+    },
+
+    "Manzanillo": {
+        "code": "MZT",
+        "country": "Mexico",
+        "aliases": [
+            "MANZANILLO", "MANZANILLO MX",
+            "MANZANILLO (MX)", "MZT"
+        ]
+    },
+
+    "Rotterdam": {
+        "code": "RTM",
+        "country": "Netherlands",
+        "aliases": [
+            "ROTTERDAM", "RTM"
+        ]
+    },
+
+    "Hamburg": {
+        "code": "HAM",
+        "country": "Germany",
+        "aliases": [
+            "HAMBURG", "HAM"
+        ]
+    },
+
+    "Felixstowe": {
+        "code": "FXT",
+        "country": "United Kingdom",
+        "aliases": [
+            "FELIXSTOWE", "FXT"
+        ]
+    },
+
+    "Los Angeles": {
+        "code": "LAX",
+        "country": "USA",
+        "aliases": [
+            "LOS ANGELES", "LA", "LAX",
+            "LONG BEACH", "LB"
+        ]
+    },
+
+    "Melbourne": {
+        "code": "MEL",
+        "country": "Australia",
+        "aliases": [
+            "MELBOURNE", "MEL"
+        ]
+    },
+
+    "Yokohama": {
+        "code": "YOK",
+        "country": "Japan",
+        "aliases": [
+            "YOKOHAMA", "YOK",
+            "TOKYO", "TOKYO/YOKOHAMA"
+        ]
+    },
+
+    "Gdansk": {
+        "code": "GDN",
+        "country": "Poland",
+        "aliases": [
+            "GDANSK", "GDYNIA",
+            "GDANSK/GDYNIA", "GDN"
+        ]
+    },
+
+    "San Francisco": {
+        "code": "SFO",
+        "country": "USA",
+        "aliases": [
+            "SAN FRANCISCO", "SF", "SFO"
+        ]
+    },
+
+    "Frankfurt": {
+        "code": "FRA",
+        "country": "Germany",
+        "aliases": [
+            "FRANKFURT", "FRA"
+        ]
+    },
+
+    "Mumbai": {
+        "code": "BOM",
+        "country": "India",
+        "aliases": [
+            "MUMBAI", "BOMBAY", "BOM"
+        ]
+    },
+
+    "Chicago": {
+        "code": "ORD",
+        "country": "USA",
+        "aliases": [
+            "CHICAGO", "CHI", "ORD"
+        ]
+    },
+
+    "Tokyo": {
+        "code": "NRT",
+        "country": "Japan",
+        "aliases": [
+            "TOKYO", "NARITA", "NRT", "TYO"
+        ]
+    },
+
+    "Paris": {
+        "code": "CDG",
+        "country": "France",
+        "aliases": [
+            "PARIS", "CDG"
+        ]
+    }
+}
+
