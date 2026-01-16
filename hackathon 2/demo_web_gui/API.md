@@ -7,6 +7,8 @@ This service exposes the demo pipeline as a JSON API for a separate frontend.
 - Content type: `application/json` (except file upload/download)
 - OpenAPI: `/docs` and `/openapi.json`
 
+API tester UI: `hackathon 2/demo_web_gui/api_tester/index.html`
+
 ## Auth / OpenAI key
 - **Header:** `X-OpenAI-Api-Key: <your-openai-key>`
 - **Alias (optional):** `X-API-Key: <your-openai-key>`

@@ -34,6 +34,13 @@ python -m uvicorn api_server:app --host 0.0.0.0 --port 8000
 - API docs: `hackathon 2/demo_web_gui/API.md`
 - Base URL: `http://localhost:8000/api/v1`
 
+## API tester UI (static frontend)
+Run from the `hackathon 2/demo_web_gui/` folder:
+```bash
+python -m http.server 5173
+```
+Then open `http://localhost:5173/api_tester/` and point it to your API base URL (default: `http://localhost:8000/api/v1`).
+
 ## Pages
 - **Freight Quote Agent Demo**: pick an email and run the pipeline with a full trace.
 - **Workflow & Methodology**: explains the end-to-end flow and includes a batch validation runner.

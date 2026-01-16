@@ -1,0 +1,782 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Freight Quote Agent – API Tester</title>
+    <style>
+      :root {
+        --bg: #0b1020;
+        --panel: rgba(17, 26, 51, 0.78);
+        --border: rgba(255, 255, 255, 0.14);
+        --text: #e8ecff;
+        --muted: rgba(232, 236, 255, 0.72);
+        --ok: #46d39a;
+        --err: #ff6b6b;
+        --warn: #ffcc66;
+        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: var(--bg);
+        color: var(--text);
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: 18px;
+      }
+      .muted {
+        margin: 0 0 14px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      a {
+        color: var(--text);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+      @media (min-width: 980px) {
+        .grid {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+      .card {
+        border: 1px solid var(--border);
+        background: var(--panel);
+        border-radius: 10px;
+        padding: 12px;
+      }
+      .card h2 {
+        margin: 0 0 10px;
+        font-size: 14px;
+      }
+      label {
+        display: block;
+        margin: 8px 0 4px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      input,
+      select,
+      textarea {
+        width: 100%;
+        padding: 8px 9px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: rgba(0, 0, 0, 0.25);
+        color: var(--text);
+        font-size: 13px;
+      }
+      textarea {
+        min-height: 110px;
+        resize: vertical;
+        font-family: var(--mono);
+        line-height: 1.45;
+      }
+      .row {
+        display: grid;
+        gap: 10px;
+      }
+      @media (min-width: 560px) {
+        .row.cols2 {
+          grid-template-columns: 1fr 1fr;
+        }
+        .row.cols3 {
+          grid-template-columns: 1fr 1fr 1fr;
+        }
+      }
+      .inline {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+        margin-top: 10px;
+      }
+      .check {
+        display: inline-flex;
+        gap: 8px;
+        align-items: center;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      button {
+        border: 1px solid var(--border);
+        background: rgba(0, 0, 0, 0.18);
+        color: var(--text);
+        padding: 8px 10px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 12px;
+      }
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.6;
+      }
+      .pill {
+        display: inline-block;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 3px 8px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .pill.ok {
+        color: var(--ok);
+      }
+      .pill.err {
+        color: var(--err);
+      }
+      .pill.warn {
+        color: var(--warn);
+      }
+      details {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 8px 10px;
+        background: rgba(0, 0, 0, 0.12);
+      }
+      summary {
+        cursor: pointer;
+        font-weight: 650;
+        font-size: 12px;
+      }
+      pre {
+        margin: 10px 0 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px;
+        background: rgba(0, 0, 0, 0.25);
+        max-height: 340px;
+        overflow: auto;
+        font-family: var(--mono);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+      .table-wrap {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        overflow: auto;
+        max-height: 340px;
+        margin-top: 10px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      th,
+      td {
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        padding: 6px 8px;
+        vertical-align: top;
+      }
+      th {
+        text-align: left;
+        position: sticky;
+        top: 0;
+        background: rgba(17, 26, 51, 0.95);
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Freight Quote Agent – API Tester</h1>
+    <p class="muted">
+      Start the API server (<code>python -m uvicorn api_server:app --port 8000</code>) then serve this folder
+      (<code>python -m http.server 5173</code> from <code>demo_web_gui</code>) and open <code>/api_tester/</code>.
+    </p>
+
+    <div class="grid">
+      <section class="card">
+        <h2>Settings</h2>
+        <div class="row cols2">
+          <div>
+            <label for="baseUrl">Base URL</label>
+            <input id="baseUrl" type="text" placeholder="http://localhost:8000/api/v1" />
+          </div>
+          <div>
+            <label for="apiKey">OpenAI API key (header)</label>
+            <input id="apiKey" type="password" placeholder="X-OpenAI-Api-Key" />
+          </div>
+        </div>
+        <div class="inline">
+          <label class="check"><input id="rememberKey" type="checkbox" />Remember key (localStorage)</label>
+          <button id="btnHealth">Health</button>
+          <span id="healthStatus" class="pill">idle</span>
+        </div>
+        <details>
+          <summary>Health response</summary>
+          <pre id="healthOut"></pre>
+        </details>
+      </section>
+
+      <section class="card">
+        <h2>Rate sheets</h2>
+        <div class="row cols3">
+          <div>
+            <label for="rateDifficulty">Difficulty</label>
+            <select id="rateDifficulty">
+              <option value="easy">easy</option>
+              <option value="medium">medium</option>
+              <option value="hard">hard</option>
+            </select>
+          </div>
+          <div>
+            <label for="rateFile">Upload (xlsx)</label>
+            <input id="rateFile" type="file" accept=".xlsx" />
+          </div>
+          <div>
+            <label for="maxRows">Max rows</label>
+            <input id="maxRows" type="number" min="1" step="1" value="50" />
+          </div>
+        </div>
+        <div class="inline">
+          <label class="check"><input id="includeRows" type="checkbox" checked />include_rows</label>
+          <label class="check"><input id="renderTables" type="checkbox" checked />render tables</label>
+        </div>
+        <div class="inline">
+          <button id="btnUploadRate">Upload</button>
+          <button id="btnNormalizeRate">Normalize</button>
+          <button id="btnGetNormalizedRate">Get normalized</button>
+          <a id="rateDownloadLink" class="pill" href="#" target="_blank" rel="noreferrer">Download xlsx</a>
+        </div>
+        <details open>
+          <summary>Response JSON</summary>
+          <pre id="rateOut"></pre>
+        </details>
+        <div id="rateRender"></div>
+      </section>
+
+      <section class="card">
+        <h2>SOP</h2>
+        <div class="row cols3">
+          <div>
+            <label for="sopDifficulty">Difficulty</label>
+            <select id="sopDifficulty">
+              <option value="easy">easy</option>
+              <option value="medium">medium</option>
+              <option value="hard">hard</option>
+            </select>
+          </div>
+          <div>
+            <label for="sopParseMode">Parse mode</label>
+            <select id="sopParseMode">
+              <option value="auto">auto</option>
+              <option value="llm">llm</option>
+              <option value="rule_based">rule_based</option>
+            </select>
+          </div>
+          <div class="check" style="margin-top: 28px">
+            <input id="sopForceRefresh" type="checkbox" />
+            <span>force_refresh</span>
+          </div>
+        </div>
+        <div class="inline">
+          <button id="btnGetSop">Get SOP.md</button>
+          <button id="btnPutSop">Update SOP.md</button>
+          <button id="btnParseSop">Parse SOP</button>
+        </div>
+        <label for="sopMarkdown">SOP markdown</label>
+        <textarea id="sopMarkdown" placeholder="# SOP ..."></textarea>
+        <details open>
+          <summary>Response JSON</summary>
+          <pre id="sopOut"></pre>
+        </details>
+        <div id="sopRender"></div>
+      </section>
+
+      <section class="card">
+        <h2>Quote</h2>
+        <div class="row cols3">
+          <div>
+            <label for="quoteDifficulty">Difficulty</label>
+            <select id="quoteDifficulty">
+              <option value="easy">easy</option>
+              <option value="medium">medium</option>
+              <option value="hard">hard</option>
+            </select>
+          </div>
+          <div>
+            <label for="quoteSopParseMode">SOP parse mode</label>
+            <select id="quoteSopParseMode">
+              <option value="auto">auto</option>
+              <option value="llm">llm</option>
+              <option value="rule_based">rule_based</option>
+            </select>
+          </div>
+          <div class="check" style="margin-top: 28px">
+            <input id="quoteForceSopRefresh" type="checkbox" />
+            <span>force_sop_refresh</span>
+          </div>
+        </div>
+
+        <div class="inline">
+          <label class="check"><input id="quoteEnableSop" type="checkbox" />enable_sop</label>
+          <label class="check"><input id="quoteUseOpenai" type="checkbox" />use_openai</label>
+          <label class="check"><input id="quoteIncludeTrace" type="checkbox" checked />include_trace</label>
+          <button id="btnFillSample">Fill sample</button>
+        </div>
+
+        <div class="row cols2">
+          <div>
+            <label for="emailFrom">from</label>
+            <input id="emailFrom" type="text" placeholder="sarah.chen@globalimports.com" />
+          </div>
+          <div>
+            <label for="emailTo">to</label>
+            <input id="emailTo" type="text" placeholder="quotes@freightco.com" />
+          </div>
+        </div>
+        <div class="row cols2">
+          <div>
+            <label for="emailSubject">subject</label>
+            <input id="emailSubject" type="text" placeholder="Quote request" />
+          </div>
+          <div>
+            <label for="emailId">email_id (optional)</label>
+            <input id="emailId" type="text" placeholder="email_api" />
+          </div>
+        </div>
+        <label for="emailBody">body</label>
+        <textarea id="emailBody" placeholder="Paste the email body here..."></textarea>
+
+        <div class="inline">
+          <button id="btnQuote">Run quote</button>
+          <span id="quoteStatus" class="pill">idle</span>
+        </div>
+        <details open>
+          <summary>Quote text</summary>
+          <pre id="quoteText"></pre>
+        </details>
+        <details>
+          <summary>Full response JSON</summary>
+          <pre id="quoteOut"></pre>
+        </details>
+      </section>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      const STORAGE = {
+        get(key, fallback = "") {
+          try {
+            const v = localStorage.getItem(key);
+            return v === null ? fallback : v;
+          } catch {
+            return fallback;
+          }
+        },
+        set(key, value) {
+          try {
+            localStorage.setItem(key, String(value));
+          } catch {
+            // ignore
+          }
+        },
+        del(key) {
+          try {
+            localStorage.removeItem(key);
+          } catch {
+            // ignore
+          }
+        },
+      };
+
+      function fmt(value) {
+        try {
+          return JSON.stringify(value, null, 2);
+        } catch {
+          return String(value);
+        }
+      }
+
+      function normalizeBaseUrl(url) {
+        const s = String(url || "").trim();
+        return s.endsWith("/") ? s.slice(0, -1) : s;
+      }
+
+      function apiUrl(path) {
+        const base = normalizeBaseUrl($("baseUrl").value || "");
+        if (!base) throw new Error("Base URL is empty");
+        const p = String(path || "");
+        return base + (p.startsWith("/") ? p : "/" + p);
+      }
+
+      function setPill(el, kind, text) {
+        el.className = "pill";
+        if (kind) el.classList.add(kind);
+        el.textContent = text;
+      }
+
+      function clearEl(el) {
+        while (el.firstChild) el.removeChild(el.firstChild);
+      }
+
+      async function request(path, { method = "GET", headers = {}, body = null } = {}) {
+        const key = String($("apiKey").value || "").trim();
+        const hdrs = new Headers(headers || {});
+        hdrs.set("Accept", "application/json");
+        if (key) hdrs.set("X-OpenAI-Api-Key", key);
+
+        const url = apiUrl(path);
+        const resp = await fetch(url, { method, headers: hdrs, body });
+        const text = await resp.text();
+        const ct = resp.headers.get("content-type") || "";
+        let data = null;
+        if (ct.includes("application/json")) {
+          try {
+            data = JSON.parse(text);
+          } catch (e) {
+            data = { _parse_error: String(e), raw_text: text };
+          }
+        }
+        return { ok: resp.ok, status: resp.status, data, text, url };
+      }
+
+      function renderTable(container, rows, maxRows) {
+        clearEl(container);
+        if (!Array.isArray(rows) || rows.length === 0) {
+          container.textContent = "No rows";
+          return;
+        }
+
+        const limit = Math.max(1, Math.min(rows.length, Number(maxRows) || 50));
+
+        const colSet = new Set();
+        for (let i = 0; i < limit; i++) {
+          const r = rows[i] || {};
+          for (const k of Object.keys(r)) colSet.add(k);
+        }
+        const cols = Array.from(colSet);
+
+        const wrap = document.createElement("div");
+        wrap.className = "table-wrap";
+        const table = document.createElement("table");
+        const thead = document.createElement("thead");
+        const trh = document.createElement("tr");
+        for (const c of cols) {
+          const th = document.createElement("th");
+          th.textContent = c;
+          trh.appendChild(th);
+        }
+        thead.appendChild(trh);
+        table.appendChild(thead);
+
+        const tbody = document.createElement("tbody");
+        for (let i = 0; i < limit; i++) {
+          const tr = document.createElement("tr");
+          const r = rows[i] || {};
+          for (const c of cols) {
+            const td = document.createElement("td");
+            const v = r[c];
+            td.textContent = v === null || v === undefined ? "" : String(v);
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+        }
+        table.appendChild(tbody);
+        wrap.appendChild(table);
+        container.appendChild(wrap);
+
+        if (rows.length > limit) {
+          const note = document.createElement("div");
+          note.className = "muted";
+          note.style.marginTop = "8px";
+          note.textContent = `Rendered ${limit} / ${rows.length} rows`;
+          container.appendChild(note);
+        }
+      }
+
+      function renderNormalized(container, payload) {
+        clearEl(container);
+        if (!payload || typeof payload !== "object") return;
+
+        if (!$("includeRows").checked) return;
+
+        const maxRows = Number($("maxRows").value || 50);
+        const renderTables = $("renderTables").checked;
+
+        const sea = payload.sea_rows || [];
+        const air = payload.air_rows || [];
+
+        const seaDetails = document.createElement("details");
+        const seaSummary = document.createElement("summary");
+        seaSummary.textContent = `Normalized: Sea (${Array.isArray(sea) ? sea.length : 0})`;
+        seaDetails.appendChild(seaSummary);
+        const seaBody = document.createElement("div");
+        if (renderTables) renderTable(seaBody, sea, maxRows);
+        else {
+          const pre = document.createElement("pre");
+          pre.textContent = fmt(sea);
+          seaBody.appendChild(pre);
+        }
+        seaDetails.appendChild(seaBody);
+
+        const airDetails = document.createElement("details");
+        const airSummary = document.createElement("summary");
+        airSummary.textContent = `Normalized: Air (${Array.isArray(air) ? air.length : 0})`;
+        airDetails.appendChild(airSummary);
+        const airBody = document.createElement("div");
+        if (renderTables) renderTable(airBody, air, maxRows);
+        else {
+          const pre = document.createElement("pre");
+          pre.textContent = fmt(air);
+          airBody.appendChild(pre);
+        }
+        airDetails.appendChild(airBody);
+
+        container.appendChild(seaDetails);
+        container.appendChild(airDetails);
+      }
+
+      function renderSopParse(container, payload) {
+        clearEl(container);
+        if (!payload || typeof payload !== "object") return;
+
+        const notes = [];
+        notes.push(payload.cached ? "cached=true" : "cached=false");
+        if (Array.isArray(payload.errors)) notes.push(...payload.errors);
+
+        const notesDetails = document.createElement("details");
+        notesDetails.open = true;
+        const notesSummary = document.createElement("summary");
+        notesSummary.textContent = "SOP parse notes";
+        notesDetails.appendChild(notesSummary);
+        const pre = document.createElement("pre");
+        pre.textContent = notes.join("\n");
+        notesDetails.appendChild(pre);
+        container.appendChild(notesDetails);
+
+        if (payload.llm_usage) {
+          const usage = document.createElement("details");
+          const s = document.createElement("summary");
+          s.textContent = "LLM usage";
+          usage.appendChild(s);
+          const p = document.createElement("pre");
+          p.textContent = fmt(payload.llm_usage);
+          usage.appendChild(p);
+          container.appendChild(usage);
+        }
+
+        if (payload.llm_raw) {
+          const raw = document.createElement("details");
+          const s = document.createElement("summary");
+          s.textContent = "SOP parser LLM raw output (JSON)";
+          raw.appendChild(s);
+          const p = document.createElement("pre");
+          p.textContent = fmt(payload.llm_raw);
+          raw.appendChild(p);
+          container.appendChild(raw);
+        }
+
+        if (payload.sop_config) {
+          const cfg = document.createElement("details");
+          const s = document.createElement("summary");
+          s.textContent = "sop_config";
+          cfg.appendChild(s);
+          const p = document.createElement("pre");
+          p.textContent = fmt(payload.sop_config);
+          cfg.appendChild(p);
+          container.appendChild(cfg);
+        }
+      }
+
+      function updateRateDownloadLink() {
+        const d = String($("rateDifficulty").value || "easy");
+        const link = $("rateDownloadLink");
+        try {
+          link.href = apiUrl(`/rate-sheets/${encodeURIComponent(d)}/source`);
+        } catch {
+          link.href = "#";
+        }
+      }
+
+      // Init: restore baseUrl + key
+      $("baseUrl").value = STORAGE.get("api_tester.base_url", "http://localhost:8000/api/v1");
+      const remember = STORAGE.get("api_tester.remember_key", "0") === "1";
+      $("rememberKey").checked = remember;
+      if (remember) $("apiKey").value = STORAGE.get("api_tester.api_key", "");
+
+      $("baseUrl").addEventListener("input", () => {
+        STORAGE.set("api_tester.base_url", $("baseUrl").value || "");
+        updateRateDownloadLink();
+      });
+
+      $("rememberKey").addEventListener("change", () => {
+        if ($("rememberKey").checked) {
+          STORAGE.set("api_tester.remember_key", "1");
+          STORAGE.set("api_tester.api_key", $("apiKey").value || "");
+        } else {
+          STORAGE.set("api_tester.remember_key", "0");
+          STORAGE.del("api_tester.api_key");
+        }
+      });
+
+      $("apiKey").addEventListener("input", () => {
+        if ($("rememberKey").checked) STORAGE.set("api_tester.api_key", $("apiKey").value || "");
+      });
+
+      $("rateDifficulty").addEventListener("change", updateRateDownloadLink);
+      updateRateDownloadLink();
+
+      $("btnHealth").addEventListener("click", async () => {
+        setPill($("healthStatus"), "warn", "loading...");
+        $("healthOut").textContent = "";
+        try {
+          const r = await request("/health");
+          $("healthOut").textContent = r.data ? fmt(r.data) : r.text;
+          setPill($("healthStatus"), r.ok ? "ok" : "err", String(r.status));
+        } catch (e) {
+          $("healthOut").textContent = String(e && e.message ? e.message : e);
+          setPill($("healthStatus"), "err", "error");
+        }
+      });
+
+      $("btnUploadRate").addEventListener("click", async () => {
+        $("rateOut").textContent = "";
+        clearEl($("rateRender"));
+        const d = String($("rateDifficulty").value || "easy");
+        const file = $("rateFile").files && $("rateFile").files[0];
+        if (!file) {
+          $("rateOut").textContent = "Pick an .xlsx file first.";
+          return;
+        }
+        const fd = new FormData();
+        fd.append("file", file, file.name);
+        try {
+          const r = await request(`/rate-sheets/${encodeURIComponent(d)}`, { method: "PUT", body: fd, headers: {} });
+          $("rateOut").textContent = r.data ? fmt(r.data) : r.text;
+        } catch (e) {
+          $("rateOut").textContent = String(e && e.message ? e.message : e);
+        }
+      });
+
+      $("btnNormalizeRate").addEventListener("click", async () => {
+        $("rateOut").textContent = "";
+        clearEl($("rateRender"));
+        const d = String($("rateDifficulty").value || "easy");
+        try {
+          const r = await request(`/rate-sheets/${encodeURIComponent(d)}/normalize`, { method: "POST" });
+          $("rateOut").textContent = r.data ? fmt(r.data) : r.text;
+        } catch (e) {
+          $("rateOut").textContent = String(e && e.message ? e.message : e);
+        }
+      });
+
+      $("btnGetNormalizedRate").addEventListener("click", async () => {
+        $("rateOut").textContent = "";
+        clearEl($("rateRender"));
+        const d = String($("rateDifficulty").value || "easy");
+        const include = $("includeRows").checked ? "true" : "false";
+        try {
+          const r = await request(`/rate-sheets/${encodeURIComponent(d)}/normalized?include_rows=${include}`);
+          $("rateOut").textContent = r.data ? fmt(r.data) : r.text;
+          if (r.data) renderNormalized($("rateRender"), r.data);
+        } catch (e) {
+          $("rateOut").textContent = String(e && e.message ? e.message : e);
+        }
+      });
+
+      $("btnGetSop").addEventListener("click", async () => {
+        $("sopOut").textContent = "";
+        clearEl($("sopRender"));
+        try {
+          const r = await request("/sop");
+          $("sopOut").textContent = r.data ? fmt(r.data) : r.text;
+          if (r.data && typeof r.data.markdown === "string") $("sopMarkdown").value = r.data.markdown;
+        } catch (e) {
+          $("sopOut").textContent = String(e && e.message ? e.message : e);
+        }
+      });
+
+      $("btnPutSop").addEventListener("click", async () => {
+        $("sopOut").textContent = "";
+        clearEl($("sopRender"));
+        try {
+          const body = JSON.stringify({ markdown: $("sopMarkdown").value || "" });
+          const r = await request("/sop", { method: "PUT", headers: { "Content-Type": "application/json" }, body });
+          $("sopOut").textContent = r.data ? fmt(r.data) : r.text;
+        } catch (e) {
+          $("sopOut").textContent = String(e && e.message ? e.message : e);
+        }
+      });
+
+      $("btnParseSop").addEventListener("click", async () => {
+        $("sopOut").textContent = "";
+        clearEl($("sopRender"));
+        const difficulty = String($("sopDifficulty").value || "easy");
+        const sop_parse_mode = String($("sopParseMode").value || "auto");
+        const force_refresh = Boolean($("sopForceRefresh").checked);
+        try {
+          const body = JSON.stringify({ difficulty, sop_parse_mode, force_refresh });
+          const r = await request("/sop/parse", { method: "POST", headers: { "Content-Type": "application/json" }, body });
+          $("sopOut").textContent = r.data ? fmt(r.data) : r.text;
+          if (r.data) renderSopParse($("sopRender"), r.data);
+        } catch (e) {
+          $("sopOut").textContent = String(e && e.message ? e.message : e);
+        }
+      });
+
+      $("btnFillSample").addEventListener("click", () => {
+        $("emailFrom").value = "sarah.chen@globalimports.com";
+        $("emailTo").value = "quotes@freightco.com";
+        $("emailSubject").value = "Quote request";
+        $("emailId").value = "email_api";
+        $("emailBody").value =
+          "Hi team,\\n\\nPlease quote SEA freight for 1x40HQ from Shanghai to Rotterdam. We also need transit time.\\n\\nThanks,\\nSarah";
+        $("quoteEnableSop").checked = true;
+        $("quoteUseOpenai").checked = false;
+        $("quoteIncludeTrace").checked = true;
+      });
+
+      $("btnQuote").addEventListener("click", async () => {
+        setPill($("quoteStatus"), "warn", "loading...");
+        $("quoteText").textContent = "";
+        $("quoteOut").textContent = "";
+        const difficulty = String($("quoteDifficulty").value || "easy");
+        const enable_sop = Boolean($("quoteEnableSop").checked);
+        const use_openai = Boolean($("quoteUseOpenai").checked);
+        const sop_parse_mode = String($("quoteSopParseMode").value || "auto");
+        const force_sop_refresh = Boolean($("quoteForceSopRefresh").checked);
+        const include_trace = Boolean($("quoteIncludeTrace").checked);
+        const email = {
+          email_id: String($("emailId").value || "").trim() || null,
+          from: String($("emailFrom").value || "").trim(),
+          to: String($("emailTo").value || "").trim(),
+          subject: String($("emailSubject").value || "").trim(),
+          body: String($("emailBody").value || ""),
+        };
+        try {
+          const body = JSON.stringify({
+            difficulty,
+            enable_sop,
+            use_openai,
+            sop_parse_mode,
+            force_sop_refresh,
+            include_trace,
+            email,
+          });
+          const r = await request("/quote", { method: "POST", headers: { "Content-Type": "application/json" }, body });
+          if (r.data && typeof r.data.quote_text === "string") $("quoteText").textContent = r.data.quote_text;
+          else $("quoteText").textContent = r.data ? fmt(r.data) : r.text;
+          $("quoteOut").textContent = r.data ? fmt(r.data) : r.text;
+          setPill($("quoteStatus"), r.ok ? "ok" : "err", String(r.status));
+        } catch (e) {
+          $("quoteOut").textContent = String(e && e.message ? e.message : e);
+          setPill($("quoteStatus"), "err", "error");
+        }
+      });
+    </script>
+  </body>
+</html>
