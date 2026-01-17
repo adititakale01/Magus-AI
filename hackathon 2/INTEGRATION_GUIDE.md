@@ -4,6 +4,87 @@
 
 ---
 
+## Git Workflow (Do This First!)
+
+Before making any code changes, set up the correct branch structure:
+
+### Step 0.1: Create a new integration branch
+
+```bash
+# Make sure you're on main and up to date
+git checkout main
+git pull origin main
+
+# Create a new branch for the integration work
+git checkout -b feature/integrated-freight-system
+```
+
+### Step 0.2: Merge the freight_agent branch
+
+```bash
+# Merge the optimized freight_agent pipeline into your new branch
+git merge origin/feature/freight-agent-v2
+
+# If there are conflicts, resolve them (there shouldn't be many since
+# freight_agent and demo_web_gui are in separate directories)
+```
+
+### Step 0.3: Verify the merge
+
+```bash
+# Check that both directories exist and have the latest code
+ls "hackathon 2/freight_agent/src/"
+ls "hackathon 2/demo_web_gui/src/"
+
+# Run freight_agent tests to make sure they pass
+cd "hackathon 2/freight_agent"
+python -m pytest tests/ -v
+```
+
+### Step 0.4: Now follow the integration steps below
+
+Once the merge is complete and tests pass, proceed with Steps 1-8 to wire the systems together.
+
+### Step 0.5: After integration is complete, open PR to main
+
+```bash
+# Stage and commit all integration changes
+git add .
+git commit -m "Integrate freight_agent pipeline into demo_web_gui
+
+- Add shared models package
+- Create pipeline adapter
+- Wire confidence scoring into HITL workflow
+- Add integration tests
+
+Co-Authored-By: [Your Name]"
+
+# Push the integration branch
+git push origin feature/integrated-freight-system
+
+# Open PR to main using GitHub CLI (or via GitHub web UI)
+gh pr create --base main --title "Integrate optimized freight pipeline with demo UI" --body "
+## Summary
+This PR combines the best of both implementations:
+- **freight_agent**: Optimized 3-call AI pipeline, frozen dataclasses, confidence scoring
+- **demo_web_gui**: Streamlit UI, FastAPI, database persistence, HITL workflow
+
+## Changes
+- Added \`shared/\` package with unified data models
+- Created adapter layer in \`demo_web_gui/src/freight_pipeline_adapter.py\`
+- Wired confidence scoring into HITL routing
+- All tests passing
+
+## Testing
+- [ ] freight_agent tests pass
+- [ ] demo_web_gui integration tests pass
+- [ ] Manual testing of quote generation
+- [ ] Manual testing of HITL workflow
+"
+```
+
+---
+
 ## Why This Integration?
 
 Both implementations bring unique strengths to the table. By combining them, we create a system that's greater than the sum of its parts.
