@@ -417,11 +417,25 @@
         <div class="inline">
           <button id="btnCreateEmailRecord">Create record (from current email + quote)</button>
           <button id="btnUpdateEmailRecord">Update status</button>
+          <button id="btnDecision">Submit decision</button>
           <button id="btnListEmailRecords">List</button>
           <button id="btnEmailRecordCounts">Status counts</button>
           <button id="btnNeedsHuman">Needs human decision</button>
           <span id="recordsStatus" class="pill">idle</span>
         </div>
+        <div class="row cols3">
+          <div>
+            <label for="decisionChoice">decision</label>
+            <select id="decisionChoice">
+              <option value="accept">accept</option>
+              <option value="reject">reject</option>
+            </select>
+          </div>
+        </div>
+        <label for="decisionRefinedQuote">refined_quote (optional)</label>
+        <textarea id="decisionRefinedQuote" placeholder="If empty, backend uses current stored reply or the last quote result."></textarea>
+        <label for="decisionComment">comment (optional; triggers LLM rewrite)</label>
+        <textarea id="decisionComment" placeholder="If provided, backend will call LLM to rewrite the quote based on email body + refined_quote + comment."></textarea>
         <details open>
           <summary>Response JSON</summary>
           <pre id="recordsOut"></pre>
@@ -1004,6 +1018,36 @@
           const r = await request(
             `/email-records/needs-human-decision?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`
           );
+          $("recordsOut").textContent = r.data ? fmt(r.data) : r.text;
+          setPill($("recordsStatus"), r.ok ? "ok" : "err", String(r.status));
+        } catch (e) {
+          $("recordsOut").textContent = String(e && e.message ? e.message : e);
+          setPill($("recordsStatus"), "err", "error");
+        }
+      });
+
+      $("btnDecision").addEventListener("click", async () => {
+        setPill($("recordsStatus"), "warn", "loading...");
+        $("recordsOut").textContent = "";
+        const id = String($("recordId").value || "").trim();
+        if (!id) {
+          setPill($("recordsStatus"), "err", "missing record_id");
+          return;
+        }
+        try {
+          const decision = String($("decisionChoice").value || "accept");
+          const refined_quote_raw = String($("decisionRefinedQuote").value || "").trim();
+          const comment_raw = String($("decisionComment").value || "").trim();
+          const fallbackQuote = String($("quoteText").textContent || "").trim();
+
+          const body = JSON.stringify({
+            id,
+            decision,
+            refined_quote: refined_quote_raw || fallbackQuote || null,
+            comment: comment_raw || null,
+          });
+
+          const r = await request("/email-records/decision", { method: "POST", headers: { "Content-Type": "application/json" }, body });
           $("recordsOut").textContent = r.data ? fmt(r.data) : r.text;
           setPill($("recordsStatus"), r.ok ? "ok" : "err", String(r.status));
         } catch (e) {

@@ -19,8 +19,28 @@ create table if not exists public.email_quote_records (
 
     type text not null default 'auto',
     status text not null default 'unprocessed',
-    config jsonb null
+    config jsonb null,
+
+    origin_city text null,
+    destination_city text null,
+    price double precision null,
+    currency text null,
+    transport_type text null,
+    has_route boolean null
 );
+
+alter table public.email_quote_records
+    add column if not exists origin_city text null;
+alter table public.email_quote_records
+    add column if not exists destination_city text null;
+alter table public.email_quote_records
+    add column if not exists price double precision null;
+alter table public.email_quote_records
+    add column if not exists currency text null;
+alter table public.email_quote_records
+    add column if not exists transport_type text null;
+alter table public.email_quote_records
+    add column if not exists has_route boolean null;
 
 do $$
 begin

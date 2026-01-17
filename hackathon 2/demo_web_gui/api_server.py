@@ -359,6 +359,12 @@ def _email_record_api_shape(item: dict[str, Any]) -> dict[str, Any]:
         "type": item.get("type"),
         "status": item.get("status"),
         "config": item.get("config"),
+        "origin_city": item.get("origin_city"),
+        "destination_city": item.get("destination_city"),
+        "price": item.get("price"),
+        "currency": item.get("currency"),
+        "transport_type": item.get("transport_type"),
+        "has_route": item.get("has_route"),
     }
 
 
@@ -431,6 +437,159 @@ def _extract_final_amounts_from_trace(trace_payload: dict[str, Any]) -> list[flo
         if isinstance(amt, (int, float)):
             out.append(float(amt))
     return out
+
+
+def _extract_canonical_destinations_from_trace(trace_payload: dict[str, Any]) -> list[str]:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    destinations: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if not title.startswith("Normalize Locations ("):
+            continue
+        data = step.get("data")
+        if not isinstance(data, dict):
+            continue
+        destination = data.get("destination")
+        if isinstance(destination, dict):
+            canonical = destination.get("canonical")
+            if canonical and str(canonical).strip():
+                destinations.append(str(canonical).strip())
+    return destinations
+
+
+def _extract_transport_types_from_trace(trace_payload: dict[str, Any]) -> list[str]:
+    modes: list[str] = []
+    shipments = _extract_shipments_from_trace(trace_payload)
+    for sh in shipments:
+        mode = str(sh.get("mode") or "").strip().casefold()
+        if mode in {"air", "sea"}:
+            modes.append(mode)
+
+    if modes:
+        return modes
+
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if title == "Normalize Locations (Air)":
+            modes.append("air")
+        elif title == "Normalize Locations (Sea)":
+            modes.append("sea")
+    return modes
+
+
+def _extract_currencies_from_trace(trace_payload: dict[str, Any]) -> list[str]:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    out: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if not title.startswith("Calculate Quote ("):
+            continue
+        data = step.get("data")
+        if not isinstance(data, dict):
+            continue
+        currency = data.get("currency")
+        if currency and str(currency).strip():
+            out.append(str(currency).strip())
+    return out
+
+
+def _extract_transit_days_from_trace(trace_payload: dict[str, Any]) -> list[int]:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    out: list[int] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if not title.startswith("Rate Lookup ("):
+            continue
+        data = step.get("data")
+        if not isinstance(data, dict):
+            continue
+        transit_days = data.get("transit_days")
+        if isinstance(transit_days, bool):
+            continue
+        if isinstance(transit_days, int):
+            out.append(int(transit_days))
+        elif isinstance(transit_days, float) and transit_days.is_integer():
+            out.append(int(transit_days))
+    return out
+
+
+def _join_unique(values: list[str], *, sep: str = "; ") -> str | None:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        s = str(value or "").strip()
+        if not s:
+            continue
+        key = s.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    if not out:
+        return None
+    return sep.join(out)
+
+
+def _infer_quote_fields_from_trace(trace_payload: dict[str, Any]) -> dict[str, Any]:
+    origins = _extract_canonical_origins_from_trace(trace_payload)
+    destinations = _extract_canonical_destinations_from_trace(trace_payload)
+    origin_city = _join_unique(origins)
+    destination_city = _join_unique(destinations)
+
+    transport_types = _extract_transport_types_from_trace(trace_payload)
+    unique_types: list[str] = []
+    for t in transport_types:
+        t_norm = str(t or "").strip().casefold()
+        if t_norm not in {"air", "sea"}:
+            continue
+        if t_norm not in unique_types:
+            unique_types.append(t_norm)
+    transport_type: str | None = None
+    if len(unique_types) == 1:
+        transport_type = unique_types[0]
+    elif len(unique_types) > 1:
+        transport_type = "mixed"
+
+    amounts = _extract_final_amounts_from_trace(trace_payload)
+    rounded_amounts = [float(round(x)) for x in amounts]
+    price: float | None = None
+    if rounded_amounts:
+        price = float(sum(rounded_amounts))
+
+    currencies = _extract_currencies_from_trace(trace_payload)
+    currency: str | None = None
+    if currencies:
+        first = str(currencies[0]).strip()
+        if first:
+            currency = first
+
+    has_route = bool(_extract_transit_days_from_trace(trace_payload))
+
+    return {
+        "origin_city": origin_city,
+        "destination_city": destination_city,
+        "price": price,
+        "currency": currency,
+        "transport_type": transport_type,
+        "has_route": has_route,
+    }
 
 
 def _decide_reply_type(*, trace_payload: dict[str, Any], email_subject: str, email_body: str) -> str:
@@ -854,6 +1013,8 @@ def create_app() -> FastAPI:
         }
 
         trace_payload = asdict(result.trace)
+        inferred = _infer_quote_fields_from_trace(trace_payload)
+        out.update(inferred)
         reply_type = _decide_reply_type(trace_payload=trace_payload, email_subject=email.subject, email_body=email.body)
         if result.error or not result.quote_text:
             reply_type = "HITL"
@@ -891,6 +1052,12 @@ def create_app() -> FastAPI:
                     record_type=payload.record_type,
                     status=("unprocessed" if result.error else payload.record_status),
                     config=config_payload,
+                    origin_city=inferred.get("origin_city"),
+                    destination_city=inferred.get("destination_city"),
+                    price=inferred.get("price"),
+                    currency=inferred.get("currency"),
+                    transport_type=inferred.get("transport_type"),
+                    has_route=inferred.get("has_route"),
                 )
             except DbNotConfiguredError as e:
                 raise HTTPException(status_code=503, detail=str(e)) from e
@@ -904,6 +1071,7 @@ def create_app() -> FastAPI:
     @router.post("/email-records")
     def create_email_record(payload: EmailRecordCreateRequest) -> dict[str, Any]:
         _load_base_config()  # loads .env
+        inferred = _infer_quote_fields_from_trace(payload.trace or {})
         try:
             record_id = insert_email_record(
                 email_id=payload.email_id,
@@ -916,6 +1084,12 @@ def create_app() -> FastAPI:
                 record_type=payload.type,
                 status=payload.status,
                 config=payload.config,
+                origin_city=inferred.get("origin_city"),
+                destination_city=inferred.get("destination_city"),
+                price=inferred.get("price"),
+                currency=inferred.get("currency"),
+                transport_type=inferred.get("transport_type"),
+                has_route=inferred.get("has_route"),
             )
             record = get_email_record(record_id=str(record_id))
         except DbNotConfiguredError as e:

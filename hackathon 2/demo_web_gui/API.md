@@ -237,6 +237,12 @@ Response (abridged):
   "quote_text": "Hi,\\n\\nThank you ...",
   "error": null,
   "type": "Auto",
+  "origin_city": "Shanghai",
+  "destination_city": "Rotterdam",
+  "price": 12345,
+  "currency": "USD",
+  "transport_type": "sea",
+  "has_route": true,
   "trace": { "llm_usage": { "calls": 2, "total_tokens": 1234 }, "steps": [ ... ] }
 }
 ```
@@ -313,7 +319,13 @@ Response:
       "reply": "...",
       "type": "auto",
       "status": "needs_human_decision",
-      "config": { "difficulty": "easy", "enable_sop": true }
+      "config": { "difficulty": "easy", "enable_sop": true },
+      "origin_city": "Shanghai",
+      "destination_city": "Rotterdam",
+      "price": 12345,
+      "currency": "USD",
+      "transport_type": "sea",
+      "has_route": true
     }
   ],
   "limit": 50,

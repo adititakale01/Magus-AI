@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 import json
+import os
 import re
 import time
 
@@ -9,6 +11,15 @@ import streamlit as st
 
 from src.config import load_app_config
 from src.data_loader import list_emails, load_email
+from src.db_store import (
+    DbNotConfiguredError,
+    count_email_records_by_status,
+    healthcheck as db_healthcheck,
+    init_schema as db_init_schema,
+    insert_email_record,
+    list_email_records,
+    list_needs_human_decision,
+)
 from src.pipeline import run_quote_pipeline
 from src.rate_sheets import NormalizedRateSheets, normalize_rate_sheets
 from src.sop import SopParseResult, load_sop_markdown, parse_sop
@@ -85,6 +96,230 @@ def _list_known_senders(email_index: dict[str, Path]) -> list[str]:
     return sorted(set(senders))
 
 
+def _get_trace_step(*, trace_payload: dict, title: str) -> dict | None:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return None
+    for step in steps:
+        if isinstance(step, dict) and str(step.get("title") or "") == title:
+            return step
+    return None
+
+
+def _extract_shipments_from_trace(trace_payload: dict) -> list[dict]:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if not title.startswith("Extraction:"):
+            continue
+        data = step.get("data")
+        if not isinstance(data, dict):
+            continue
+        shipments = data.get("shipments")
+        if isinstance(shipments, list):
+            return [s for s in shipments if isinstance(s, dict)]
+    return []
+
+
+def _extract_canonical_origins_from_trace(trace_payload: dict) -> list[str]:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    origins: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if not title.startswith("Normalize Locations ("):
+            continue
+        data = step.get("data")
+        if not isinstance(data, dict):
+            continue
+        origin = data.get("origin")
+        if isinstance(origin, dict):
+            canonical = origin.get("canonical")
+            if canonical and str(canonical).strip():
+                origins.append(str(canonical).strip())
+    return origins
+
+
+def _extract_canonical_destinations_from_trace(trace_payload: dict) -> list[str]:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    destinations: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if not title.startswith("Normalize Locations ("):
+            continue
+        data = step.get("data")
+        if not isinstance(data, dict):
+            continue
+        destination = data.get("destination")
+        if isinstance(destination, dict):
+            canonical = destination.get("canonical")
+            if canonical and str(canonical).strip():
+                destinations.append(str(canonical).strip())
+    return destinations
+
+
+def _extract_final_amounts_from_trace(trace_payload: dict) -> list[float]:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    out: list[float] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if not title.startswith("Calculate Quote ("):
+            continue
+        data = step.get("data")
+        if not isinstance(data, dict):
+            continue
+        amt = data.get("final_amount")
+        if isinstance(amt, (int, float)):
+            out.append(float(amt))
+    return out
+
+
+def _extract_currencies_from_trace(trace_payload: dict) -> list[str]:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    out: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if not title.startswith("Calculate Quote ("):
+            continue
+        data = step.get("data")
+        if not isinstance(data, dict):
+            continue
+        currency = data.get("currency")
+        if currency and str(currency).strip():
+            out.append(str(currency).strip())
+    return out
+
+
+def _extract_transit_days_from_trace(trace_payload: dict) -> list[int]:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    out: list[int] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if not title.startswith("Rate Lookup ("):
+            continue
+        data = step.get("data")
+        if not isinstance(data, dict):
+            continue
+        transit_days = data.get("transit_days")
+        if isinstance(transit_days, bool):
+            continue
+        if isinstance(transit_days, int):
+            out.append(int(transit_days))
+        elif isinstance(transit_days, float) and transit_days.is_integer():
+            out.append(int(transit_days))
+    return out
+
+
+def _extract_transport_types_from_trace(trace_payload: dict) -> list[str]:
+    modes: list[str] = []
+    shipments = _extract_shipments_from_trace(trace_payload)
+    for sh in shipments:
+        mode = str(sh.get("mode") or "").strip().casefold()
+        if mode in {"air", "sea"}:
+            modes.append(mode)
+
+    if modes:
+        return modes
+
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+        if title == "Normalize Locations (Air)":
+            modes.append("air")
+        elif title == "Normalize Locations (Sea)":
+            modes.append("sea")
+    return modes
+
+
+def _join_unique(values: list[str], *, sep: str = "; ") -> str | None:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        s = str(value or "").strip()
+        if not s:
+            continue
+        key = s.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    if not out:
+        return None
+    return sep.join(out)
+
+
+def _infer_quote_fields_from_trace(trace_payload: dict) -> dict:
+    origins = _extract_canonical_origins_from_trace(trace_payload)
+    destinations = _extract_canonical_destinations_from_trace(trace_payload)
+    origin_city = _join_unique(origins)
+    destination_city = _join_unique(destinations)
+
+    transport_types = _extract_transport_types_from_trace(trace_payload)
+    unique_types: list[str] = []
+    for t in transport_types:
+        t_norm = str(t or "").strip().casefold()
+        if t_norm not in {"air", "sea"}:
+            continue
+        if t_norm not in unique_types:
+            unique_types.append(t_norm)
+    transport_type: str | None = None
+    if len(unique_types) == 1:
+        transport_type = unique_types[0]
+    elif len(unique_types) > 1:
+        transport_type = "mixed"
+
+    amounts = _extract_final_amounts_from_trace(trace_payload)
+    rounded_amounts = [float(round(x)) for x in amounts]
+    price: float | None = None
+    if rounded_amounts:
+        price = float(sum(rounded_amounts))
+
+    currencies = _extract_currencies_from_trace(trace_payload)
+    currency: str | None = None
+    if currencies:
+        first = str(currencies[0]).strip()
+        if first:
+            currency = first
+
+    has_route = bool(_extract_transit_days_from_trace(trace_payload))
+
+    return {
+        "origin_city": origin_city,
+        "destination_city": destination_city,
+        "price": price,
+        "currency": currency,
+        "transport_type": transport_type,
+        "has_route": has_route,
+    }
+
+
 def main() -> None:
     st.set_page_config(page_title="Freight Quote Agent Demo", layout="wide")
 
@@ -130,6 +365,19 @@ def main() -> None:
         st.markdown("**Rate sheets**")
         for diff in ["easy", "medium", "hard"]:
             st.write(f"- {diff.title()}: `{paths[diff]}`" + (" (found)" if paths[diff].exists() else " (missing)"))
+
+        st.divider()
+        st.subheader("Persistence (optional)")
+        has_supabase = bool(os.getenv("SUPABASE_URL")) and bool(
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+        )
+        has_pg = bool(os.getenv("DATABASE_URL"))
+        st.write("Mode: " + ("Supabase REST" if has_supabase else ("Postgres" if has_pg else "disabled")))
+        auto_persist = st.toggle(
+            "Auto-persist latest run",
+            value=False,
+            help="Stores email + quote + trace + inferred fields into `email_quote_records` (requires DB config).",
+        )
 
     if not email_index:
         st.error(f"No emails found under: `{config.data.data_dir}`")
@@ -358,6 +606,20 @@ def main() -> None:
                 )
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
+            trace_payload = asdict(result.trace)
+            inferred = _infer_quote_fields_from_trace(trace_payload)
+            st.session_state["last_run"] = {
+                "email_id": email.email_id,
+                "difficulty": difficulty,
+                "enable_sop": bool(enable_sop),
+                "use_openai": bool(use_openai),
+                "quote_text": result.quote_text,
+                "error": result.error,
+                "elapsed_ms": elapsed_ms,
+                "trace": trace_payload,
+                "inferred": inferred,
+            }
+
             st.markdown("**Run metrics**")
             st.write(f"Latency: {elapsed_ms:.0f} ms")
             st.write(
@@ -374,6 +636,9 @@ def main() -> None:
             else:
                 st.markdown("**Formatted Quote**")
                 st.code(result.quote_text or "", language="text")
+
+            st.markdown("**Inferred fields (for DB/API)**")
+            st.write(inferred)
 
             st.markdown("**Trace (steps + artifacts)**")
             for step in result.trace.steps:
@@ -395,6 +660,83 @@ def main() -> None:
                         )
                     if step.data is not None:
                         st.json(step.data)
+
+            if auto_persist:
+                st.markdown("**DB auto-persist**")
+                config_payload = {
+                    "difficulty": difficulty,
+                    "enable_sop": bool(enable_sop),
+                    "use_openai": bool(use_openai),
+                }
+                try:
+                    record_id = insert_email_record(
+                        email_id=email.email_id,
+                        email_from=email.sender,
+                        email_to=email.to,
+                        subject=email.subject,
+                        body=email.body,
+                        reply=result.quote_text,
+                        trace=trace_payload,
+                        record_type="auto",
+                        status=("unprocessed" if result.error else "needs_human_decision"),
+                        config=config_payload,
+                        origin_city=inferred.get("origin_city"),
+                        destination_city=inferred.get("destination_city"),
+                        price=inferred.get("price"),
+                        currency=inferred.get("currency"),
+                        transport_type=inferred.get("transport_type"),
+                        has_route=inferred.get("has_route"),
+                    )
+                    st.success(f"Saved to DB: `{record_id}`")
+                except DbNotConfiguredError as e:
+                    st.warning(str(e))
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"DB persist failed: {e.__class__.__name__}: {e}")
+
+        with st.expander("3) Persistence dashboard (optional)", expanded=False):
+            col_a, col_b = st.columns([0.25, 0.75])
+            with col_a:
+                if st.button("DB healthcheck", type="secondary", key="db_healthcheck"):
+                    try:
+                        st.write(db_healthcheck())
+                    except DbNotConfiguredError as e:
+                        st.warning(str(e))
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"{e.__class__.__name__}: {e}")
+                if st.button("DB init/verify", type="secondary", key="db_init"):
+                    try:
+                        st.write(db_init_schema())
+                    except DbNotConfiguredError as e:
+                        st.warning(str(e))
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"{e.__class__.__name__}: {e}")
+
+            with col_b:
+                st.markdown("**Status counts**")
+                try:
+                    st.write(count_email_records_by_status())
+                except DbNotConfiguredError as e:
+                    st.warning(str(e))
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"{e.__class__.__name__}: {e}")
+
+            st.markdown("**Needs human decision (latest 50)**")
+            try:
+                items = list_needs_human_decision(limit=50, offset=0)
+                st.dataframe(items, use_container_width=True)
+            except DbNotConfiguredError as e:
+                st.warning(str(e))
+            except Exception as e:  # noqa: BLE001
+                st.error(f"{e.__class__.__name__}: {e}")
+
+            st.markdown("**All records (latest 50)**")
+            try:
+                items = list_email_records(limit=50, offset=0)
+                st.dataframe(items, use_container_width=True)
+            except DbNotConfiguredError as e:
+                st.warning(str(e))
+            except Exception as e:  # noqa: BLE001
+                st.error(f"{e.__class__.__name__}: {e}")
 
 
 if __name__ == "__main__":

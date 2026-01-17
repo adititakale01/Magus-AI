@@ -397,6 +397,28 @@ When SOP is enabled, the output is wrapped as an email reply and SOP-required fi
             with tab:
                 st.markdown(_load_solution_md(data_dir=config.data.data_dir, email_id=email_id))
 
+    with st.expander("7) Persistence + HITL (optional)", expanded=False):
+        st.markdown(
+            """
+The demo can optionally persist every quote (email + reply + trace + config) into **Supabase/Postgres** and support a
+human-in-the-loop workflow:
+
+- Table: `public.email_quote_records`
+- Schema SQL: `hackathon 2/demo_web_gui/sql/001_email_reply_records.sql`
+- API endpoints: `hackathon 2/demo_web_gui/api_server.py`
+
+**Derived fields (inferred from the trace)** are stored and returned by the API:
+- `origin_city` / `destination_city` (canonical city names)
+- `transport_type` (`air` / `sea` / `mixed`)
+- `price` + `currency` (sum of route totals from the trace)
+- `has_route` (true if transit days were found in rate lookup)
+
+**HITL decision endpoint**
+- `POST /api/v1/email-records/decision`
+- Accept/reject a record, optionally provide a `comment` to trigger an LLM rewrite, then send the final quote via a webhook.
+"""
+        )
+
     st.header("Batch validation (10 hackathon emails)")
 
     col_a, col_b = st.columns([0.35, 0.65], gap="large")

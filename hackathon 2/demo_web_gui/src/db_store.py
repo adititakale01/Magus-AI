@@ -146,9 +146,22 @@ _SCHEMA_STATEMENTS: list[str] = [
 
         type text NOT NULL DEFAULT 'auto',
         status text NOT NULL DEFAULT 'unprocessed',
-        config jsonb NULL
+        config jsonb NULL,
+
+        origin_city text NULL,
+        destination_city text NULL,
+        price double precision NULL,
+        currency text NULL,
+        transport_type text NULL,
+        has_route boolean NULL
     );
     """,
+    "ALTER TABLE public.email_quote_records ADD COLUMN IF NOT EXISTS origin_city text NULL;",
+    "ALTER TABLE public.email_quote_records ADD COLUMN IF NOT EXISTS destination_city text NULL;",
+    "ALTER TABLE public.email_quote_records ADD COLUMN IF NOT EXISTS price double precision NULL;",
+    "ALTER TABLE public.email_quote_records ADD COLUMN IF NOT EXISTS currency text NULL;",
+    "ALTER TABLE public.email_quote_records ADD COLUMN IF NOT EXISTS transport_type text NULL;",
+    "ALTER TABLE public.email_quote_records ADD COLUMN IF NOT EXISTS has_route boolean NULL;",
     """
     DO $$
     BEGIN
@@ -248,6 +261,12 @@ def insert_email_record(
     record_type: EmailRecordType = "auto",
     status: EmailRecordStatus = "needs_human_decision",
     config: dict[str, Any] | None,
+    origin_city: str | None = None,
+    destination_city: str | None = None,
+    price: float | None = None,
+    currency: str | None = None,
+    transport_type: str | None = None,
+    has_route: bool | None = None,
 ) -> uuid.UUID:
     record_id = uuid.uuid4()
     if _use_supabase():
@@ -266,6 +285,12 @@ def insert_email_record(
                     "type": str(record_type),
                     "status": str(status),
                     "config": _jsonable(config) if config is not None else None,
+                    "origin_city": origin_city,
+                    "destination_city": destination_city,
+                    "price": float(price) if isinstance(price, (int, float)) else None,
+                    "currency": currency,
+                    "transport_type": transport_type,
+                    "has_route": bool(has_route) if has_route is not None else None,
                 }
             ).execute()
         except Exception as e:  # noqa: BLE001
@@ -282,11 +307,13 @@ def insert_email_record(
                 INSERT INTO public.email_quote_records (
                     id, email_id, email_from, email_to, subject, body,
                     reply, trace,
-                    type, status, config
+                    type, status, config,
+                    origin_city, destination_city, price, currency, transport_type, has_route
                 ) VALUES (
                     %(id)s, %(email_id)s, %(email_from)s, %(email_to)s, %(subject)s, %(body)s,
                     %(reply)s, %(trace)s,
-                    %(type)s, %(status)s, %(config)s
+                    %(type)s, %(status)s, %(config)s,
+                    %(origin_city)s, %(destination_city)s, %(price)s, %(currency)s, %(transport_type)s, %(has_route)s
                 );
                 """,
                 {
@@ -301,6 +328,12 @@ def insert_email_record(
                     "type": str(record_type),
                     "status": str(status),
                     "config": Jsonb(_jsonable(config)) if config is not None else None,
+                    "origin_city": origin_city,
+                    "destination_city": destination_city,
+                    "price": float(price) if isinstance(price, (int, float)) else None,
+                    "currency": currency,
+                    "transport_type": transport_type,
+                    "has_route": bool(has_route) if has_route is not None else None,
                 },
             )
     return record_id
@@ -319,7 +352,13 @@ _EMAIL_RECORD_SELECT_COLUMNS = """
     trace,
     type,
     status,
-    config
+    config,
+    origin_city,
+    destination_city,
+    price,
+    currency,
+    transport_type,
+    has_route
 """
 
 
@@ -410,7 +449,13 @@ def list_email_records(*, limit: int = 50, offset: int = 0) -> list[dict[str, An
                     trace,
                     type,
                     status,
-                    config
+                    config,
+                    origin_city,
+                    destination_city,
+                    price,
+                    currency,
+                    transport_type,
+                    has_route
                 FROM public.email_quote_records
                 ORDER BY created_at DESC
                 LIMIT %(limit)s OFFSET %(offset)s
@@ -501,7 +546,13 @@ def list_needs_human_decision(*, limit: int = 200, offset: int = 0) -> list[dict
                     trace,
                     type,
                     status,
-                    config
+                    config,
+                    origin_city,
+                    destination_city,
+                    price,
+                    currency,
+                    transport_type,
+                    has_route
                 FROM public.email_quote_records
                 WHERE status = 'needs_human_decision'
                 ORDER BY created_at DESC
