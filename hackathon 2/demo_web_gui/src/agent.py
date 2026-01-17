@@ -9,6 +9,8 @@ from openai import OpenAI
 
 from src.config import AppConfig
 from src.data_loader import EmailMessage
+from src.llm_usage import usage_from_response
+from src.prompts import EXTRACTION_SYSTEM_PROMPT, extraction_user_prompt
 from src.trace import RunTrace
 
 
@@ -43,7 +45,7 @@ def extract_requests(
 ) -> ExtractionResult:
     if use_openai and config.openai.api_key:
         try:
-            res = _extract_with_openai(email=email, config=config)
+            res, llm_usage = _extract_with_openai(email=email, config=config)
             trace.add(
                 "Extraction: OpenAI",
                 summary="Parsed structured request(s) via OpenAI.",
@@ -51,12 +53,15 @@ def extract_requests(
                     "shipments": [asdict(s) for s in res.shipments],
                     "clarification_questions": res.clarification_questions,
                 },
+                used_llm=True,
+                llm_usage=llm_usage,
             )
             return res
         except Exception as e:  # noqa: BLE001
             trace.add(
                 "Extraction: OpenAI (failed)",
                 summary=f"Falling back to rule-based extraction: {e.__class__.__name__}: {e}",
+                used_llm=True,
             )
 
     res = _extract_rule_based(email=email)
@@ -68,34 +73,11 @@ def extract_requests(
     return res
 
 
-def _extract_with_openai(*, email: EmailMessage, config: AppConfig) -> ExtractionResult:
+def _extract_with_openai(*, email: EmailMessage, config: AppConfig) -> tuple[ExtractionResult, dict[str, Any]]:
     client = OpenAI(api_key=config.openai.api_key)
 
-    system = (
-        "You extract shipping rate request details from emails.\n"
-        "Return ONLY valid JSON (no markdown) with this schema:\n"
-        "{\n"
-        '  "shipments": [\n'
-        "    {\n"
-        '      "mode": "air"|"sea",\n'
-        '      "origin_raw": string|null,\n'
-        '      "destination_raw": string|null,\n'
-        '      "quantity": integer|null,\n'
-        '      "container_size_ft": 20|40|null,\n'
-        '      "actual_weight_kg": number|null,\n'
-        '      "volume_cbm": number|null,\n'
-        '      "commodity": string|null,\n'
-        '      "notes": string|null\n'
-        "    }\n"
-        "  ],\n"
-        '  "clarification_questions": [string]\n'
-        "}\n"
-        "If an email contains multiple routes, return multiple shipments.\n"
-        "If info is missing, use null and add a clarification question.\n"
-        "Do not invent values."
-    )
-
-    user = f"SUBJECT:\n{email.subject}\n\nBODY:\n{email.body}"
+    system = EXTRACTION_SYSTEM_PROMPT
+    user = extraction_user_prompt(subject=email.subject, body=email.body)
 
     kwargs: dict[str, Any] = dict(
         model=config.openai.model,
@@ -111,6 +93,7 @@ def _extract_with_openai(*, email: EmailMessage, config: AppConfig) -> Extractio
     except TypeError:
         resp = client.chat.completions.create(**kwargs)
 
+    llm_usage = usage_from_response(resp, model=config.openai.model, calls=1)
     content = resp.choices[0].message.content or ""
     data = _coerce_json_object(content)
 
@@ -139,7 +122,10 @@ def _extract_with_openai(*, email: EmailMessage, config: AppConfig) -> Extractio
         questions = data.get("clarification_questions")
         if not isinstance(questions, list):
             questions = []
-        return ExtractionResult(shipments=shipments, clarification_questions=[str(q) for q in questions if str(q).strip()])
+        return (
+            ExtractionResult(shipments=shipments, clarification_questions=[str(q) for q in questions if str(q).strip()]),
+            llm_usage,
+        )
 
     mode = data.get("mode")
     if mode not in ("air", "sea"):
@@ -155,7 +141,7 @@ def _extract_with_openai(*, email: EmailMessage, config: AppConfig) -> Extractio
         commodity=_none_if_blank(data.get("commodity")),
         notes=_none_if_blank(data.get("notes")),
     )
-    return ExtractionResult(shipments=[single], clarification_questions=[])
+    return ExtractionResult(shipments=[single], clarification_questions=[]), llm_usage
 
 
 def _extract_rule_based(*, email: EmailMessage) -> ExtractionResult:

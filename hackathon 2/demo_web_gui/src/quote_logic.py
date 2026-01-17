@@ -131,8 +131,13 @@ def compute_quote_amounts(
     request: ShipmentRequest,
     rate: RateMatch,
     config: AppConfig,
+    margin_override: float | None = None,
+    discount_pct: float = 0.0,
+    surcharge: float = 0.0,
 ) -> dict:
-    margin = config.pricing.margin
+    margin = float(margin_override) if margin_override is not None else float(config.pricing.margin)
+    discount_pct = float(discount_pct or 0.0)
+    surcharge = float(surcharge or 0.0)
 
     if rate.mode == "air":
         if request.actual_weight_kg is None or request.volume_cbm is None:
@@ -145,10 +150,18 @@ def compute_quote_amounts(
         base = chargeable * rate.base_rate
         if rate.min_charge is not None:
             base = max(base, float(rate.min_charge))
-        final = base * (1.0 + margin)
+        base_before_discount = float(base)
+        base_after_discount = base_before_discount * (1.0 - discount_pct)
+        final_before_surcharge = base_after_discount * (1.0 + margin)
+        final = final_before_surcharge + surcharge
         return {
             "chargeable_weight_kg": chargeable,
-            "base_amount": base,
+            "base_amount": base_before_discount,
+            "base_amount_after_discount": base_after_discount,
+            "discount_pct": discount_pct,
+            "discount_amount": base_before_discount - base_after_discount,
+            "surcharge": surcharge,
+            "final_amount_before_surcharge": final_before_surcharge,
             "final_amount": final,
             "currency": rate.currency,
             "margin": margin,
@@ -157,10 +170,17 @@ def compute_quote_amounts(
     if rate.mode == "sea":
         if request.quantity is None or request.container_size_ft is None:
             raise ValueError("Sea freight requires quantity and container_size_ft.")
-        base = float(request.quantity) * rate.base_rate
-        final = base * (1.0 + margin)
+        base_before_discount = float(request.quantity) * float(rate.base_rate)
+        base_after_discount = base_before_discount * (1.0 - discount_pct)
+        final_before_surcharge = base_after_discount * (1.0 + margin)
+        final = final_before_surcharge + surcharge
         return {
-            "base_amount": base,
+            "base_amount": base_before_discount,
+            "base_amount_after_discount": base_after_discount,
+            "discount_pct": discount_pct,
+            "discount_amount": base_before_discount - base_after_discount,
+            "surcharge": surcharge,
+            "final_amount_before_surcharge": final_before_surcharge,
             "final_amount": final,
             "currency": rate.currency,
             "margin": margin,
