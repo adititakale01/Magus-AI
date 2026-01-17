@@ -76,6 +76,8 @@ def calculate_quote(
         show_chargeable_weight=sop.show_chargeable_weight,
         show_subtotals=sop.show_subtotals,
         hide_margin=sop.hide_margin,
+        # SOP context for response
+        sop_summary=_build_sop_summary(sop),
         # Status
         is_complete=all(li.rate_match is not None for li in line_items),
         has_warnings=any(li.warnings for li in line_items),
@@ -149,6 +151,9 @@ def _calculate_line_item(
     # === STEP 5: Build warnings ===
     warnings = _build_warnings(rate_match, sop)
 
+    # === STEP 6: Build SOP context for response ===
+    discount_reason = _build_discount_reason(sop, total_containers) if discount_amount > 0 else None
+
     return QuoteLineItem(
         shipment_index=index,
         description=description,
@@ -158,6 +163,8 @@ def _calculate_line_item(
         margin_amount=round(margin_amount, 2),
         surcharge_total=round(surcharge_total, 2),
         line_total=round(line_total, 2),
+        discount_reason=discount_reason,
+        surcharges=enriched_shipment.surcharges,  # Pass through surcharge details
         warnings=tuple(warnings),
         errors=(),
     )
@@ -185,6 +192,61 @@ def _calculate_discount_percent(sop: CustomerSOP, quantity: int) -> float:
         return discount
 
     return 0.0
+
+
+def _build_discount_reason(sop: CustomerSOP, quantity: int) -> str | None:
+    """
+    Build a human-readable discount reason for the response.
+    References the SOP so customers understand why they got a discount.
+    """
+    # Flat discount (Strategic Partner, etc.)
+    if sop.flat_discount_percent is not None and sop.flat_discount_percent > 0:
+        return f"{sop.flat_discount_percent:.0f}% discount per your account agreement"
+
+    # Volume discount tiers
+    if sop.volume_discount_tiers:
+        applied_discount = 0.0
+        applied_threshold = 0
+        for threshold, percent in sop.volume_discount_tiers:
+            if quantity >= threshold:
+                applied_discount = percent
+                applied_threshold = threshold
+
+        if applied_discount > 0:
+            return f"{applied_discount:.0f}% volume discount ({quantity} containers, {applied_threshold}+ tier) per your account agreement"
+
+    return None
+
+
+def _build_sop_summary(sop: CustomerSOP) -> str:
+    """
+    Build a summary of the SOP rules for context in the response.
+    """
+    parts = []
+
+    # Discount info
+    if sop.flat_discount_percent:
+        parts.append(f"{sop.flat_discount_percent:.0f}% account discount")
+    elif sop.volume_discount_tiers:
+        tiers = ", ".join(f"{t[1]:.0f}% for {t[0]}+ containers" for t in sop.volume_discount_tiers)
+        parts.append(f"Volume discounts: {tiers}")
+
+    # Mode restriction
+    if sop.mode_restriction:
+        parts.append(f"{sop.mode_restriction} freight only")
+
+    # Origin restriction
+    if sop.origin_restriction:
+        parts.append(f"Origin restricted to {sop.origin_restriction}")
+
+    # Margin (if not default)
+    if sop.margin_percent != 15.0:
+        parts.append(f"{sop.margin_percent:.0f}% margin")
+
+    if not parts:
+        return "Standard pricing"
+
+    return " | ".join(parts)
 
 
 def _build_description(shipment, rate_match: RateMatch | None) -> str:

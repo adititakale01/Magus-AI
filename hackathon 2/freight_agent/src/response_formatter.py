@@ -32,9 +32,18 @@ based on the quote data provided.
    - Add price breakdown ONLY if show_subtotals=true
 4. Include any WARNINGS prominently (but professionally)
 5. If any routes have ERRORS (no rate found), explain clearly and offer next steps
-6. Mention quote validity (7 days from today)
-7. End with an offer to answer questions
-8. Professional sign-off
+6. End with an offer to answer questions
+7. Sign off with EXACTLY:
+   Best regards,
+   Magus AI
+
+## SOP REFERENCES (IMPORTANT):
+When explaining pricing, ALWAYS reference the customer's account agreement:
+- If a DISCOUNT was applied, mention it with the discount_reason (e.g., "Your 10% account discount has been applied")
+- If SURCHARGES were added, explain each one using the surcharge name and reason (e.g., "Australia Biosecurity Fee: $150")
+- If a request was REJECTED due to mode/origin restrictions, explain per their account agreement
+- Use phrases like "per your account agreement" or "as per your SOP" when referencing special pricing
+- The sop_summary field provides context about the customer's account terms
 
 ## TONE GUIDELINES:
 - Match the formality of the customer's original email
@@ -63,6 +72,7 @@ def _quote_to_dict(quote: Quote) -> dict:
     return {
         "customer_name": quote.customer_name,
         "customer_email": quote.customer_email,
+        "sop_summary": quote.sop_summary,  # SOP context for referencing in response
         "line_items": [
             {
                 "shipment_index": li.shipment_index,
@@ -70,8 +80,13 @@ def _quote_to_dict(quote: Quote) -> dict:
                 "has_rate": li.rate_match is not None,
                 "base_price": li.base_price,
                 "discount_amount": li.discount_amount,
+                "discount_reason": li.discount_reason,  # Why this discount was applied (per SOP)
                 "margin_amount": li.margin_amount,
                 "surcharge_total": li.surcharge_total,
+                "surcharges": [  # Detailed surcharge breakdown with reasons
+                    {"name": s.name, "amount": s.amount, "reason": s.reason}
+                    for s in li.surcharges
+                ] if li.surcharges else [],
                 "line_total": li.line_total,
                 "transit_days": li.rate_match.transit_days if li.rate_match else None,
                 "chargeable_weight_kg": li.rate_match.chargeable_weight_kg if li.rate_match else None,
@@ -206,3 +221,119 @@ Generate the email response now. Return only the email body text.
         generated_at=datetime.now().isoformat(),
         model_used=model,
     )
+
+
+def format_response_streaming(
+    quote: Quote,
+    original_email: Email,
+    client,  # Regular OpenAI client
+    model: str = "gpt-4o-mini",
+):
+    """
+    Streaming version of format_response for real-time output.
+
+    Yields chunks of text as they arrive from the API, providing
+    a better user experience with perceived lower latency.
+
+    Args:
+        quote: The calculated quote with all pricing
+        original_email: The original customer email for context/tone matching
+        client: OpenAI client (sync)
+        model: Model to use (default: gpt-4o-mini)
+
+    Yields:
+        str: Chunks of the response body as they arrive
+
+    Returns:
+        After iteration completes, you can call .get_result() on the
+        returned generator to get the final QuoteResponse.
+    """
+    # Build system prompt with display flags
+    system_prompt = FORMATTER_SYSTEM_PROMPT.format(
+        show_transit_time=quote.show_transit_time,
+        show_chargeable_weight=quote.show_chargeable_weight,
+        show_subtotals=quote.show_subtotals,
+        hide_margin=quote.hide_margin,
+    )
+
+    # Build user prompt with email and quote data
+    quote_json = json.dumps(_quote_to_dict(quote), indent=2)
+    user_prompt = f"""
+## ORIGINAL EMAIL FROM CUSTOMER:
+From: {original_email.sender}
+Subject: {original_email.subject}
+
+{original_email.body}
+
+## QUOTE DATA:
+{quote_json}
+
+## TODAY'S DATE: {datetime.now().strftime("%B %d, %Y")}
+
+Generate the email response now. Return only the email body text.
+"""
+
+    # Create streaming response
+    stream = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.7,
+        stream=True,  # Enable streaming!
+    )
+
+    # Yield chunks as they arrive
+    full_body = []
+    for chunk in stream:
+        # Each chunk has a delta with partial content
+        if chunk.choices and chunk.choices[0].delta.content:
+            content = chunk.choices[0].delta.content
+            full_body.append(content)
+            yield content
+
+    # After streaming completes, build and store the final result
+    # The caller can access this via the generator's return value
+    return QuoteResponse(
+        subject=f"RE: {original_email.subject}",
+        body="".join(full_body).strip(),
+        quote=quote,
+        generated_at=datetime.now().isoformat(),
+        model_used=model,
+    )
+
+
+def format_response_streaming_with_result(
+    quote: Quote,
+    original_email: Email,
+    client,
+    model: str = "gpt-4o-mini",
+) -> tuple[callable, callable]:
+    """
+    Convenience wrapper that returns both a streaming iterator and a way to get the final result.
+
+    Usage:
+        stream, get_result = format_response_streaming_with_result(quote, email, client)
+        for chunk in stream():
+            print(chunk, end="", flush=True)
+        response = get_result()
+
+    Returns:
+        Tuple of (stream_function, get_result_function)
+    """
+    result_holder = {"response": None}
+
+    def stream():
+        gen = format_response_streaming(quote, original_email, client, model)
+        try:
+            while True:
+                yield next(gen)
+        except StopIteration as e:
+            # Generator returned the QuoteResponse
+            result_holder["response"] = e.value
+
+    def get_result() -> QuoteResponse:
+        return result_holder["response"]
+
+    return stream, get_result

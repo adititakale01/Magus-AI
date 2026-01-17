@@ -231,6 +231,10 @@ class QuoteLineItem:
     surcharge_total: float | None = None
     line_total: float | None = None
 
+    # SOP context for response formatting
+    discount_reason: str | None = None  # e.g., "10% Strategic Partner discount"
+    surcharges: tuple[Surcharge, ...] = ()  # Detailed surcharge breakdown
+
     # For display
     warnings: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()   # e.g., "No rate found for this route"
@@ -257,6 +261,9 @@ class Quote:
     show_chargeable_weight: bool = False
     show_subtotals: bool = False
     hide_margin: bool = False
+
+    # SOP context for response formatting (reference in explanations)
+    sop_summary: str | None = None  # e.g., "Strategic Partner - 10% discount, sea freight only"
 
     # Overall status
     is_complete: bool = True       # All shipments have rates
@@ -287,6 +294,78 @@ class QuoteResponse:
 
 
 # ============================================================================
+# CONFIDENCE SCORE
+# ============================================================================
+
+@dataclass(frozen=True)
+class ConfidenceScore:
+    """
+    Confidence level for the pipeline output.
+
+    Helps frontend/humans know how much to trust the result:
+    - HIGH: All data extracted, rates found, no errors → ready to send
+    - MEDIUM: Needs clarification or partial data → human review recommended
+    - LOW: Can't determine key info → escalate to human
+    """
+    level: Literal["high", "medium", "low"]
+    reason: str  # Human-readable explanation
+
+    # Detailed breakdown
+    has_all_data: bool = True
+    has_rates: bool = True
+    has_validation_errors: bool = False
+    needs_clarification: bool = False
+
+
+def calculate_confidence(
+    extraction: "ExtractionResult",
+    enriched: "EnrichedRequest",
+    quote: "Quote"
+) -> ConfidenceScore:
+    """
+    Calculate confidence score based on pipeline results.
+
+    HIGH: Complete quote with no issues
+    MEDIUM: Partial quote or needs clarification
+    LOW: Cannot produce a meaningful quote
+    """
+    has_all_data = len(extraction.missing_fields) == 0
+    has_rates = quote.is_complete
+    has_validation_errors = len(enriched.validation_errors) > 0
+    needs_clarification = extraction.needs_clarification
+
+    # Determine level
+    if has_all_data and has_rates and not has_validation_errors and not needs_clarification:
+        level = "high"
+        reason = "Complete quote ready to send"
+    elif needs_clarification:
+        level = "medium"
+        reason = f"Clarification needed: {', '.join(extraction.missing_fields) or 'ambiguous request'}"
+    elif has_validation_errors:
+        # SOP violations take precedence over rate issues
+        level = "medium"
+        reason = f"SOP validation issue: {enriched.validation_errors[0].message}"
+    elif not has_rates and has_all_data:
+        level = "medium"
+        reason = "No rates found for this route"
+    elif not has_all_data:
+        level = "low"
+        reason = f"Missing required data: {', '.join(extraction.missing_fields)}"
+    else:
+        level = "low"
+        reason = "Unable to process request"
+
+    return ConfidenceScore(
+        level=level,
+        reason=reason,
+        has_all_data=has_all_data,
+        has_rates=has_rates,
+        has_validation_errors=has_validation_errors,
+        needs_clarification=needs_clarification
+    )
+
+
+# ============================================================================
 # PIPELINE RESULT (combines everything)
 # ============================================================================
 
@@ -306,6 +385,9 @@ class PipelineResult:
 
     # Final output
     response: QuoteResponse
+
+    # Confidence score
+    confidence: ConfidenceScore | None = None
 
     # Metadata
     processing_time_ms: int = 0

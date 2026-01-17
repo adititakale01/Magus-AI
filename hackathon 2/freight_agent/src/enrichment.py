@@ -30,6 +30,30 @@ load_dotenv()
 
 
 # ============================================================================
+# CUSTOMER DOMAIN LOOKUP (fast, reliable, no Qontext needed)
+# ============================================================================
+
+CUSTOMER_DOMAINS = {
+    "globalimports.com": "Global Imports Ltd",
+    "techparts.io": "TechParts Inc",
+    "autospares.de": "AutoSpares GmbH",
+    "quickship.co.uk": "QuickShip UK",
+    "vietexport.vn": "VietExport",
+}
+
+
+def get_customer_by_domain(email: str) -> str | None:
+    """
+    Fast internal lookup - no Qontext call needed!
+    Returns customer name if domain matches, None if unknown.
+    """
+    if "@" not in email:
+        return None
+    domain = email.split("@")[1].lower()
+    return CUSTOMER_DOMAINS.get(domain)
+
+
+# ============================================================================
 # VALIDATION TOOL (called by GPT)
 # ============================================================================
 
@@ -192,11 +216,13 @@ ENRICHMENT_SCHEMA = {
 # SYSTEM PROMPT
 # ============================================================================
 
-SYSTEM_PROMPT = """You are parsing freight customer data from a knowledge graph and validating shipments.
+SYSTEM_PROMPT = """You are parsing freight SOP rules and validating shipments.
+
+The customer has already been identified (or marked as unknown) - use the name provided.
 
 TASKS:
-1. Parse the customer name from the context
-2. Parse the SOP rules into structured format (discounts, margins, restrictions, output requirements)
+1. Use the customer name provided (KNOWN CUSTOMER or "Unknown Customer")
+2. Parse SOP rules from context into structured format
 3. Parse any surcharges that apply to each destination
 4. For EACH shipment, call the validate_shipment tool to check SOP restrictions
 
@@ -206,7 +232,7 @@ LOCATION NORMALIZATION (do this BEFORE calling validate_shipment):
 - "Ningbo", "Ningpo" → normalize to "Ningbo"
 - Keep other locations as-is but standardize capitalization
 
-DEFAULT VALUES (use if not specified in context):
+DEFAULT VALUES (use for unknown customers OR if not in context):
 - margin_percent: 15
 - flat_discount_percent: null
 - volume_discount_tiers: null
@@ -224,7 +250,7 @@ IMPORTANT:
 - Call validate_shipment ONCE per shipment
 - Normalize locations before calling the tool
 - The tool does exact string matching, so normalization is critical
-- If no customer found, use "Unknown Customer" and default SOP values"""
+- For unknown customers, use default SOP values with no restrictions"""
 
 
 # ============================================================================
@@ -240,29 +266,30 @@ def extract_domain(email: str) -> str:
 
 def collect_qontext_context(
     extraction: ExtractionResult,
-    qontext_client: QontextClient
+    qontext_client: QontextClient,
+    customer_name: str | None = None,
 ) -> dict:
     """
-    Batch all Qontext queries and return combined context.
-    This is REST API only - no GPT cost!
+    Batch Qontext queries for SOP rules and surcharges.
+    Customer lookup is now done internally via CUSTOMER_DOMAINS - much faster!
+
+    Args:
+        extraction: The extraction result
+        qontext_client: Qontext client
+        customer_name: Known customer name from domain lookup (None = unknown)
     """
-    domain = extract_domain(extraction.sender_email)
+    # Query 1: Customer SOP (only if we have a known customer)
+    sop_context = []
+    if customer_name:
+        sop_response = qontext_client.retrieve(
+            f"What are all the rules, discounts, restrictions, and requirements for {customer_name}?",
+            limit=15,
+            depth=2
+        )
+        if sop_response.success:
+            sop_context = sop_response.context
 
-    # Query 1: Customer by domain
-    customer_response = qontext_client.retrieve(
-        f"What customer has email domain @{domain}?",
-        limit=5,
-        depth=1
-    )
-
-    # Query 2: Customer SOP (we'll use domain-based query since we don't know name yet)
-    sop_response = qontext_client.retrieve(
-        f"What are all the rules, discounts, restrictions, and requirements for the customer with email domain @{domain}?",
-        limit=15,
-        depth=2
-    )
-
-    # Query 3: Surcharges for each unique destination
+    # Query 2: Surcharges for each unique destination
     destinations = set()
     for shipment in extraction.shipments:
         if shipment.destination_raw:
@@ -275,8 +302,8 @@ def collect_qontext_context(
             surcharge_responses[dest] = response.context
 
     return {
-        "customer_context": customer_response.context if customer_response.success else [],
-        "sop_context": sop_response.context if sop_response.success else [],
+        "customer_name": customer_name,  # Already known from domain lookup!
+        "sop_context": sop_context,
         "surcharge_context": surcharge_responses
     }
 
@@ -309,10 +336,13 @@ def enrich_request(
     if qontext_client is None:
         qontext_client = QontextClient()
 
-    # Step 1: Batch all Qontext queries (no GPT cost!)
-    context = collect_qontext_context(extraction, qontext_client)
+    # Step 1: Fast internal customer lookup (no Qontext needed!)
+    customer_name = get_customer_by_domain(extraction.sender_email)
 
-    # Step 2: Build the prompt with all context
+    # Step 2: Get SOP rules and surcharges from Qontext
+    context = collect_qontext_context(extraction, qontext_client, customer_name)
+
+    # Step 3: Build the prompt with all context
     shipments_info = []
     for i, s in enumerate(extraction.shipments):
         shipments_info.append({
@@ -322,12 +352,15 @@ def enrich_request(
             "destination": s.destination_raw
         })
 
+    # Build customer info section
+    if customer_name:
+        customer_section = f"KNOWN CUSTOMER: {customer_name}"
+    else:
+        customer_section = "UNKNOWN CUSTOMER (use default SOP values)"
+
     user_prompt = f"""Parse the following context and validate the shipments.
 
-EMAIL DOMAIN: @{extract_domain(extraction.sender_email)}
-
-QONTEXT - CUSTOMER INFO:
-{json.dumps(context['customer_context'], indent=2)}
+{customer_section}
 
 QONTEXT - SOP RULES:
 {json.dumps(context['sop_context'], indent=2)}
@@ -339,10 +372,11 @@ SHIPMENTS TO VALIDATE:
 {json.dumps(shipments_info, indent=2)}
 
 Remember to:
-1. Parse customer name and SOP rules
-2. Parse surcharges for each shipment's destination
-3. Call validate_shipment tool for EACH shipment (normalize locations first!)
-4. Return the final structured output"""
+1. Use the customer name provided above (or "Unknown Customer" if unknown)
+2. Parse SOP rules from context (or use defaults if unknown customer)
+3. Parse surcharges for each shipment's destination
+4. Call validate_shipment tool for EACH shipment (normalize locations first!)
+5. Return the final structured output"""
 
     # Step 3: Call GPT with tool
     messages = [
