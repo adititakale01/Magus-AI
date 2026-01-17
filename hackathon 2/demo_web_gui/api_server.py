@@ -592,16 +592,22 @@ def _infer_quote_fields_from_trace(trace_payload: dict[str, Any]) -> dict[str, A
     }
 
 
-def _decide_reply_type(*, trace_payload: dict[str, Any], email_subject: str, email_body: str) -> str:
+def _decide_reply_type(*, trace_payload: dict[str, Any], email_subject: str, email_body: str) -> tuple[str, list[dict[str, Any]]]:
+    reasons: list[dict[str, Any]] = []
+
     sop_step = _get_trace_step(trace_payload=trace_payload, title="SOP")
     sop_data = sop_step.get("data") if isinstance(sop_step, dict) else None
 
+    sop_enabled = False
+    sop_loaded = False
     sop_matched = False
     sop_allowed_modes: set[str] | None = None
     sop_origin_required: set[str] | None = None
     sop_parse_errors: list[str] = []
 
     if isinstance(sop_data, dict):
+        sop_enabled = bool(sop_data.get("enabled"))
+        sop_loaded = bool(sop_data.get("sop_loaded"))
         matched_profile = sop_data.get("matched_profile")
         sop_matched = isinstance(matched_profile, dict)
         if isinstance(matched_profile, dict):
@@ -616,45 +622,61 @@ def _decide_reply_type(*, trace_payload: dict[str, Any], email_subject: str, ema
         if isinstance(parse_errors, list):
             sop_parse_errors = [str(x) for x in parse_errors if str(x).strip()]
 
-    if not sop_matched:
-        return "HITL"
-    if sop_parse_errors:
-        return "HITL"
-
     shipments = _extract_shipments_from_trace(trace_payload)
-    if sop_allowed_modes:
+    if sop_enabled and sop_parse_errors:
+        reasons.append({"code": "sop_parse_errors", "detail": sop_parse_errors})
+
+    if sop_enabled and sop_loaded and sop_matched and sop_allowed_modes:
         for sh in shipments:
             mode = str(sh.get("mode") or "").strip()
             if mode and mode not in sop_allowed_modes:
-                return "HITL"
+                reasons.append({"code": "sop_mode_conflict", "detail": {"mode": mode, "allowed_modes": sorted(sop_allowed_modes)}})
+                break
 
-    if sop_origin_required:
+    if sop_enabled and sop_loaded and sop_matched and sop_origin_required:
         for origin in _extract_canonical_origins_from_trace(trace_payload):
             if origin not in sop_origin_required:
-                return "HITL"
+                reasons.append(
+                    {"code": "sop_origin_conflict", "detail": {"origin_city": origin, "origin_required": sorted(sop_origin_required)}}
+                )
+                break
 
-    steps = trace_payload.get("steps")
-    if isinstance(steps, list) and any(
-        isinstance(s, dict) and str(s.get("title") or "") == "Clarification Required" for s in steps
-    ):
-        return "HITL"
+    clar_step = _get_trace_step(trace_payload=trace_payload, title="Clarification Required")
+    if isinstance(clar_step, dict):
+        clar_data = clar_step.get("data") if isinstance(clar_step.get("data"), dict) else None
+        reasons.append({"code": "clarification_required", "detail": clar_data})
 
     threshold = float(os.getenv("HITL_LARGE_ORDER_USD") or 20000)
     amounts = _extract_final_amounts_from_trace(trace_payload)
     if amounts and (max(amounts) >= threshold or sum(amounts) >= threshold):
-        return "HITL"
+        reasons.append(
+            {
+                "code": "large_order",
+                "detail": {"threshold_usd": threshold, "max_amount": max(amounts), "sum_amount": sum(amounts), "amounts": amounts},
+            }
+        )
 
-    for sh in shipments:
-        notes = sh.get("notes")
-        if notes and str(notes).strip():
-            return "HITL"
+    note_values = [str(sh.get("notes") or "").strip() for sh in shipments if str(sh.get("notes") or "").strip()]
+    if note_values:
+        note_matches: list[str] = []
+        for note in note_values:
+            if any(re.search(pat, note, flags=re.IGNORECASE) for pat in _SPECIAL_REQUEST_KEYWORDS):
+                note_matches.append(note)
+        if note_matches:
+            reasons.append({"code": "special_request_notes", "detail": note_matches})
 
     text = f"{email_subject}\n{email_body}"
+    keyword_matches: list[dict[str, str]] = []
     for pat in _SPECIAL_REQUEST_KEYWORDS:
-        if re.search(pat, text, flags=re.IGNORECASE):
-            return "HITL"
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            keyword_matches.append({"pattern": pat, "match": m.group(0)})
+    if keyword_matches:
+        reasons.append({"code": "special_request_keywords", "detail": keyword_matches})
 
-    return "Auto"
+    if reasons:
+        return "HITL", reasons
+    return "Auto", []
 
 
 def _rates_payload(*, rates: NormalizedRateSheets, include_rows: bool) -> dict[str, Any]:
@@ -1015,9 +1037,34 @@ def create_app() -> FastAPI:
         trace_payload = asdict(result.trace)
         inferred = _infer_quote_fields_from_trace(trace_payload)
         out.update(inferred)
-        reply_type = _decide_reply_type(trace_payload=trace_payload, email_subject=email.subject, email_body=email.body)
-        if result.error or not result.quote_text:
+        reply_type, hitl_reasons = _decide_reply_type(
+            trace_payload=trace_payload,
+            email_subject=email.subject,
+            email_body=email.body,
+        )
+        if result.error:
+            hitl_reasons.append({"code": "pipeline_error", "detail": str(result.error)})
+        if not result.quote_text:
+            hitl_reasons.append({"code": "missing_quote_text"})
+        if hitl_reasons:
             reply_type = "HITL"
+
+        if reply_type == "HITL":
+            decision_step = {
+                "title": "HITL Decision",
+                "summary": "Requires human review based on heuristic signals.",
+                "data": {"type": "HITL", "reasons": hitl_reasons},
+                "used_llm": False,
+                "llm_usage": None,
+            }
+            steps = trace_payload.get("steps")
+            if isinstance(steps, list):
+                trace_payload["steps"] = [*steps, decision_step]
+            else:
+                trace_payload["steps"] = [decision_step]
+
+            out["hitl_reasons"] = hitl_reasons
+
         out["type"] = reply_type
 
         if payload.include_trace:

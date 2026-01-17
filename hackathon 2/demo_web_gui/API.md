@@ -246,13 +246,14 @@ Response (abridged):
   "trace": { "llm_usage": { "calls": 2, "total_tokens": 1234 }, "steps": [ ... ] }
 }
 ```
+If `type=HITL`, the response also includes `hitl_reasons` and the trace appends a `HITL Decision` step with the same reasons.
 
 Behavior:
 - Rate sheets are normalized once and cached per difficulty (auto invalidated on file upload).
 - When `enable_sop=true`, the server uses the **cached parsed SOP** for that difficulty if available; otherwise it parses SOP once and reuses it for subsequent quotes.
 - When `use_openai=true`, missing `X-OpenAI-Api-Key` returns `401`.
 - When `persist=true`, the server stores an `email_quote_records` row and adds `record_id` to the response.
-- `type` is `Auto` or `HITL` (human-in-the-loop). The server returns `HITL` if SOP was not matched, if SOP conflicts/parse errors exist, if the order amount is very large (env: `HITL_LARGE_ORDER_USD`, default `20000`), or if special requests are detected (notes/keywords).
+- `type` is `Auto` or `HITL` (human-in-the-loop). The server returns `HITL` if clarification is required, if SOP parse errors / SOP rule conflicts exist, if the order amount is very large (env: `HITL_LARGE_ORDER_USD`, default `20000`), if special requests are detected (keywords), or if the pipeline failed to produce a quote.
 
 Status values (for `record_status` / stored `status`):
 - `unprocessed` (没处理)
