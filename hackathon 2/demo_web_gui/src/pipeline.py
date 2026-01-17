@@ -390,10 +390,24 @@ def run_quote_pipeline(
 
             missing_location = False
             if not origin_res.canonical:
-                clarifications.append("Which airport/city is the origin?")
+                if shipment.origin_raw:
+                    hint = ""
+                    if "ningbo" in str(shipment.origin_raw).casefold() and "Shanghai" in air_origins:
+                        hint = " (Our air rate card supports Shanghai.)"
+                    clarifications.append(f"For air freight, please confirm the origin airport/city (parsed: {shipment.origin_raw}).{hint}")
+                else:
+                    clarifications.append("Which airport/city is the origin?")
                 missing_location = True
             if not dest_res.canonical:
-                clarifications.append("Which airport/city is the destination?")
+                if shipment.destination_raw:
+                    hint = ""
+                    if "rotterdam" in str(shipment.destination_raw).casefold() and "Amsterdam" in air_destinations:
+                        hint = " (Rotterdam is not in our air rate card; nearest option is Amsterdam.)"
+                    clarifications.append(
+                        f"For air freight, please confirm the destination airport/city (parsed: {shipment.destination_raw}).{hint}"
+                    )
+                else:
+                    clarifications.append("Which airport/city is the destination?")
                 missing_location = True
             if missing_location:
                 continue
@@ -630,7 +644,15 @@ def run_quote_pipeline(
                                 alternative = f"{alt_qty} x {alt_size}ft @ {_format_money(alt_per)} each = {_format_money(alt_subtotal)} total{suffix}"
                 else:
                     clarifications.append(
-                        f"For sea freight {origin_res.canonical} -> {dest_res.canonical}, please confirm container size (20ft/40ft) and quantity."
+                        (
+                            f"For sea freight {origin_res.canonical} -> {dest_res.canonical}, please confirm container size (20ft/40ft) and quantity."
+                            if (effective.container_size_ft not in (20, 40) and effective.quantity is None)
+                            else (
+                                f"For sea freight {origin_res.canonical} -> {dest_res.canonical}, please confirm container size (20ft/40ft)."
+                                if effective.container_size_ft not in (20, 40)
+                                else f"For sea freight {origin_res.canonical} -> {dest_res.canonical}, please confirm container quantity."
+                            )
+                        )
                     )
                     continue
 
