@@ -39,6 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    bind_host = str(args.host)
+    connect_host = bind_host
+    if connect_host in {"0.0.0.0", "::"}:
+        connect_host = "127.0.0.1"
+
     authtoken = (os.getenv("NGROK_AUTHTOKEN") or "").strip()
     if not authtoken:
         sys.stderr.write("Missing NGROK_AUTHTOKEN. Set it in your shell and re-run.\n")
@@ -49,20 +54,20 @@ def main(argv: list[str] | None = None) -> int:
     server: uvicorn.Server | None = None
     server_thread: threading.Thread | None = None
 
-    if not args.no_start and not _port_is_open(args.host, args.port):
+    if not args.no_start and not _port_is_open(connect_host, args.port):
         config = uvicorn.Config(
             "api_server:app",
-            host=args.host,
+            host=bind_host,
             port=args.port,
             log_level="info",
         )
         server = uvicorn.Server(config)
         server_thread = threading.Thread(target=server.run, daemon=True)
         server_thread.start()
-        _wait_port(args.host, args.port, timeout_s=15.0)
+        _wait_port(connect_host, args.port, timeout_s=15.0)
 
     try:
-        listener = ngrok.forward(f"http://{args.host}:{args.port}", "http")
+        listener = ngrok.forward(f"http://{connect_host}:{args.port}", "http")
     except Exception as e:
         sys.stderr.write(f"Failed to start ngrok tunnel: {e}\n")
         if server is not None:
@@ -94,4 +99,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
