@@ -20,10 +20,11 @@ from src.db_store import (
     list_email_records,
     list_needs_human_decision,
 )
-from api_server import _confidence_from_reply, _decide_reply_type
+from api_server import _confidence_from_reply, _decide_reply_type, _hitl_summary_from_trace
 from src.pipeline import run_quote_pipeline
 from src.rate_sheets import NormalizedRateSheets, normalize_rate_sheets
 from src.sop import SopParseResult, load_sop_markdown, parse_sop
+from src.trace import TraceStep
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -609,6 +610,42 @@ def main() -> None:
 
             trace_payload = asdict(result.trace)
             inferred = _infer_quote_fields_from_trace(trace_payload)
+            reply_type, hitl_reasons = _decide_reply_type(
+                trace_payload=trace_payload,
+                email_subject=str(email.subject or ""),
+                email_body=str(email.body or ""),
+            )
+            if result.error:
+                hitl_reasons.append({"code": "pipeline_error", "detail": str(result.error)})
+            if not result.quote_text:
+                hitl_reasons.append({"code": "missing_quote_text"})
+            if hitl_reasons:
+                reply_type = "HITL"
+
+            if reply_type == "HITL":
+                decision_step = {
+                    "title": "HITL Decision",
+                    "summary": _hitl_summary_from_trace(trace_payload),
+                    "data": {"type": "HITL", "reasons": hitl_reasons},
+                    "used_llm": False,
+                    "llm_usage": None,
+                }
+                steps = trace_payload.get("steps")
+                if isinstance(steps, list):
+                    trace_payload["steps"] = [*steps, decision_step]
+                else:
+                    trace_payload["steps"] = [decision_step]
+                result.trace.steps.append(
+                    TraceStep(
+                        title="HITL Decision",
+                        summary=str(decision_step.get("summary") or ""),
+                        data=decision_step.get("data"),
+                        used_llm=False,
+                        llm_usage=None,
+                    )
+                )
+
+            confidence = _confidence_from_reply(reply_type=reply_type, hitl_reasons=hitl_reasons)
             st.session_state["last_run"] = {
                 "email_id": email.email_id,
                 "difficulty": difficulty,
@@ -616,6 +653,9 @@ def main() -> None:
                 "use_openai": bool(use_openai),
                 "quote_text": result.quote_text,
                 "error": result.error,
+                "type": reply_type,
+                "confidence": confidence,
+                "hitl_reasons": hitl_reasons,
                 "elapsed_ms": elapsed_ms,
                 "trace": trace_payload,
                 "inferred": inferred,
@@ -637,6 +677,9 @@ def main() -> None:
             else:
                 st.markdown("**Formatted Quote**")
                 st.code(result.quote_text or "", language="text")
+
+            st.markdown("**Reply classification (API-compatible)**")
+            st.write({"type": reply_type, "confidence": confidence, "hitl_reasons": hitl_reasons if reply_type == "HITL" else []})
 
             st.markdown("**Inferred fields (for DB/API)**")
             st.write(inferred)
@@ -670,19 +713,6 @@ def main() -> None:
                     "use_openai": bool(use_openai),
                 }
                 try:
-                    reply_type, hitl_reasons = _decide_reply_type(
-                        trace_payload=trace_payload,
-                        email_subject=str(email.subject or ""),
-                        email_body=str(email.body or ""),
-                    )
-                    if result.error:
-                        hitl_reasons.append({"code": "pipeline_error", "detail": str(result.error)})
-                    if not result.quote_text:
-                        hitl_reasons.append({"code": "missing_quote_text"})
-                    if hitl_reasons:
-                        reply_type = "HITL"
-                    confidence = _confidence_from_reply(reply_type=reply_type, hitl_reasons=hitl_reasons)
-
                     record_id = insert_email_record(
                         email_id=email.email_id,
                         email_from=email.sender,
@@ -692,7 +722,7 @@ def main() -> None:
                         reply=result.quote_text,
                         trace=trace_payload,
                         record_type="auto",
-                        status=("unprocessed" if result.error else "needs_human_decision"),
+                        status=("unprocessed" if result.error else ("auto_processed" if reply_type == "Auto" else "needs_human_decision")),
                         confidence=confidence,
                         config=config_payload,
                         origin_city=inferred.get("origin_city"),

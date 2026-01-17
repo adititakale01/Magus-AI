@@ -68,6 +68,93 @@ def _filter_optional_clarification_questions(questions: list[str]) -> list[str]:
     return out
 
 
+def _filter_mode_irrelevant_questions(*, shipments: list[ShipmentRequest], questions: list[str]) -> list[str]:
+    if not questions:
+        return []
+
+    modes = {str(s.mode or "").strip().casefold() for s in shipments if getattr(s, "mode", None)}
+    if not modes:
+        return questions
+
+    out: list[str] = []
+    for q in questions:
+        text = str(q or "").strip()
+        if not text:
+            continue
+        t = text.casefold()
+
+        # If we're doing SEA, weight/volume are not required for pricing in this demo.
+        if modes == {"sea"}:
+            if any(k in t for k in ["actual weight", "weight", " kg", "volume", " cbm"]):
+                continue
+
+        # If we're doing AIR, container size/quantity are irrelevant.
+        if modes == {"air"}:
+            if "container" in t or "20ft" in t or "40ft" in t:
+                continue
+
+        out.append(text)
+
+    return out
+
+
+def _infer_qty_container_from_text(text: str) -> tuple[int | None, int | None]:
+    return _match_qty_container(str(text or ""))
+
+
+def _postprocess_shipments_latest_override(*, email_body: str, shipments: list[ShipmentRequest]) -> list[ShipmentRequest]:
+    if not shipments:
+        return []
+    latest_body, _older_body = _split_latest_context_sections(email_body)
+    qty_hint, size_hint = _infer_qty_container_from_text(latest_body)
+    if qty_hint is None and size_hint is None:
+        return shipments
+
+    out: list[ShipmentRequest] = []
+    for s in shipments:
+        if s.mode != "sea":
+            out.append(s)
+            continue
+        out.append(
+            ShipmentRequest(
+                mode=s.mode,
+                origin_raw=s.origin_raw,
+                destination_raw=s.destination_raw,
+                quantity=s.quantity if s.quantity is not None else qty_hint,
+                container_size_ft=s.container_size_ft if s.container_size_ft is not None else size_hint,
+                actual_weight_kg=s.actual_weight_kg,
+                volume_cbm=s.volume_cbm,
+                commodity=s.commodity,
+                notes=s.notes,
+            )
+        )
+    return out
+
+
+def _split_latest_context_sections(body: str) -> tuple[str, str]:
+    text = str(body or "")
+    marker = "\n\nOLDER CONTEXT (use only if missing in latest):\n"
+    if marker in text:
+        latest, older = text.split(marker, 1)
+        latest = latest.replace("LATEST MESSAGE (authoritative, override older values):\n", "").strip()
+        return latest, older.strip()
+    return text, ""
+
+
+def _merge_shipments_latest_over_old(*, latest: ShipmentRequest, old: ShipmentRequest) -> ShipmentRequest:
+    return ShipmentRequest(
+        mode=latest.mode or old.mode,
+        origin_raw=latest.origin_raw if latest.origin_raw is not None else old.origin_raw,
+        destination_raw=latest.destination_raw if latest.destination_raw is not None else old.destination_raw,
+        quantity=latest.quantity if latest.quantity is not None else old.quantity,
+        container_size_ft=latest.container_size_ft if latest.container_size_ft is not None else old.container_size_ft,
+        actual_weight_kg=latest.actual_weight_kg if latest.actual_weight_kg is not None else old.actual_weight_kg,
+        volume_cbm=latest.volume_cbm if latest.volume_cbm is not None else old.volume_cbm,
+        commodity=latest.commodity if latest.commodity is not None else old.commodity,
+        notes=latest.notes if latest.notes is not None else old.notes,
+    )
+
+
 def extract_requests(
     *,
     email: EmailMessage,
@@ -78,6 +165,12 @@ def extract_requests(
     if use_openai and config.openai.api_key:
         try:
             res, llm_usage = _extract_with_openai(email=email, config=config)
+            res = ExtractionResult(shipments=_postprocess_shipments_latest_override(email_body=email.body, shipments=res.shipments), clarification_questions=res.clarification_questions)
+            filtered_questions = _filter_mode_irrelevant_questions(
+                shipments=res.shipments,
+                questions=_filter_optional_clarification_questions(res.clarification_questions),
+            )
+            res = ExtractionResult(shipments=res.shipments, clarification_questions=filtered_questions)
             trace.add(
                 "Extraction: OpenAI",
                 summary="Parsed structured request(s) via OpenAI.",
@@ -94,15 +187,19 @@ def extract_requests(
                     summary="LLM returned no shipments; falling back to rule-based extraction.",
                 )
                 fallback = _extract_rule_based(email=email)
+                filtered_questions = _filter_mode_irrelevant_questions(
+                    shipments=fallback.shipments,
+                    questions=_filter_optional_clarification_questions(res.clarification_questions),
+                )
                 trace.add(
                     "Extraction: Rule-based",
                     summary="Parsed structured request(s) via regex rules (fallback after empty LLM parse).",
                     data={
                         "shipments": [asdict(s) for s in fallback.shipments],
-                        "clarification_questions": res.clarification_questions,
+                        "clarification_questions": filtered_questions,
                     },
                 )
-                return ExtractionResult(shipments=fallback.shipments, clarification_questions=res.clarification_questions)
+                return ExtractionResult(shipments=fallback.shipments, clarification_questions=filtered_questions)
             return res
         except Exception as e:  # noqa: BLE001
             trace.add(
@@ -112,6 +209,13 @@ def extract_requests(
             )
 
     res = _extract_rule_based(email=email)
+    res = ExtractionResult(
+        shipments=res.shipments,
+        clarification_questions=_filter_mode_irrelevant_questions(
+            shipments=res.shipments,
+            questions=_filter_optional_clarification_questions(res.clarification_questions),
+        ),
+    )
     trace.add(
         "Extraction: Rule-based",
         summary="Parsed structured request(s) via regex rules.",
@@ -197,31 +301,33 @@ def _extract_with_openai(*, email: EmailMessage, config: AppConfig) -> tuple[Ext
 
 
 def _extract_rule_based(*, email: EmailMessage) -> ExtractionResult:
-    text = f"{email.subject}\n{email.body}"
-    mode = _infer_mode(text)
+    latest_body, older_body = _split_latest_context_sections(email.body)
+    text_latest = f"{email.subject}\n{latest_body}"
+    text_full = f"{email.subject}\n{email.body}"
+    mode = _infer_mode(text_full)
 
-    multi = _extract_multi_route_sea(email.body)
+    multi = _extract_multi_route_sea(latest_body)
     if multi:
         return ExtractionResult(shipments=multi, clarification_questions=[])
 
-    origin_raw = _match_any_field(email.body, ["origin", "from"])
-    destination_raw = _match_any_field(email.body, ["destination", "to"])
+    origin_raw = _match_any_field(latest_body, ["origin", "from"])
+    destination_raw = _match_any_field(latest_body, ["destination", "to"])
 
     if not origin_raw or not destination_raw:
-        pair = _match_from_to_pair(email.body)
+        pair = _match_from_to_pair(latest_body)
         if pair:
             origin_raw, destination_raw = pair
 
-    actual_weight_kg = _match_number(text, r"(\d+(?:\.\d+)?)\s*kg")
-    volume_cbm = _match_number(text, r"(\d+(?:\.\d+)?)\s*(?:cbm|cubic\s+meters?|m3)\b")
+    actual_weight_kg = _match_number(text_latest, r"(\d+(?:\.\d+)?)\s*kg")
+    volume_cbm = _match_number(text_latest, r"(\d+(?:\.\d+)?)\s*(?:cbm|cubic\s+meters?|m3)\b")
 
-    commodity = _match_any_field(email.body, ["commodity"])
-    if not commodity and re.search(r"(?i)\bfurniture\b", text):
+    commodity = _match_any_field(latest_body, ["commodity"])
+    if not commodity and re.search(r"(?i)\bfurniture\b", text_latest):
         commodity = "furniture"
 
-    quantity, container_size_ft = _match_qty_container(text)
+    quantity, container_size_ft = _match_qty_container(text_latest)
 
-    shipments = [
+    shipments: list[ShipmentRequest] = [
         ShipmentRequest(
             mode=mode,
             origin_raw=origin_raw,
@@ -234,6 +340,19 @@ def _extract_rule_based(*, email: EmailMessage) -> ExtractionResult:
             notes=None,
         )
     ]
+
+    if older_body:
+        older_email = EmailMessage(
+            email_id=email.email_id,
+            sender=email.sender,
+            to=email.to,
+            subject=email.subject,
+            body=older_body,
+        )
+        older_res = _extract_rule_based(email=older_email)
+        if older_res.shipments and shipments:
+            shipments = [_merge_shipments_latest_over_old(latest=shipments[0], old=older_res.shipments[0])]
+
     return ExtractionResult(shipments=shipments, clarification_questions=[])
 
 

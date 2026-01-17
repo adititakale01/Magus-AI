@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import re
+import html as _html
 
 from src.agent import ShipmentRequest, extract_requests
 from src.config import AppConfig
@@ -58,6 +59,60 @@ def _filter_clarification_questions(questions: list[str]) -> list[str]:
     return out
 
 
+_REPLY_SPLIT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?is)<hr\\b[^>]*>.*$"),
+    re.compile(r"(?is)<div\\s+id=[\"']divrplyfwdmsg[\"'][^>]*>.*$"),
+    re.compile(r"(?im)^\\s*-{2,}\\s*original\\s+message\\s*-{2,}\\s*$"),
+    re.compile(r"(?im)^\\s*from:\\s+.+$\\s*^\\s*sent:\\s+.+$\\s*^\\s*to:\\s+.+$\\s*^\\s*subject:\\s+.+$"),
+    re.compile(r"(?im)^\\s*on\\s+.+?wrote:\\s*$"),
+]
+
+
+def _strip_html_to_text(value: str) -> str:
+    s = str(value or "")
+    if "<" not in s and ">" not in s:
+        return s
+    s = re.sub(r"(?is)<br\\s*/?>", "\n", s)
+    s = re.sub(r"(?is)</p\\s*>", "\n", s)
+    s = re.sub(r"(?is)</div\\s*>", "\n", s)
+    s = re.sub(r"(?is)<[^>]+>", " ", s)
+    s = _html.unescape(s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \\t\\f\\v]+", " ", s)
+    s = re.sub(r"\\n\\s*\\n\\s*\\n+", "\n\n", s)
+    return s.strip()
+
+
+def _split_email_latest_and_context(body: str) -> tuple[str, str]:
+    raw = str(body or "")
+    if not raw.strip():
+        return "", ""
+
+    src = raw
+    is_html = "<html" in raw.casefold() or "<body" in raw.casefold() or "</div" in raw.casefold()
+
+    split_at: int | None = None
+    for pat in _REPLY_SPLIT_PATTERNS:
+        m = pat.search(src)
+        if m:
+            split_at = m.start()
+            break
+
+    latest_raw = src if split_at is None else src[:split_at]
+    older_raw = "" if split_at is None else src[split_at:]
+
+    if is_html:
+        latest = _strip_html_to_text(latest_raw)
+        older = _strip_html_to_text(older_raw)
+    else:
+        latest = latest_raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+        older = older_raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    latest = "\n".join([ln.strip() for ln in latest.split("\n")]).strip()
+    older = "\n".join([ln.strip() for ln in older.split("\n")]).strip()
+    return latest, older
+
+
 @dataclass(frozen=True)
 class PipelineResult:
     quote_text: str | None
@@ -99,6 +154,32 @@ def run_quote_pipeline(
     sop_config: SopConfig | None = None,
 ) -> PipelineResult:
     trace = RunTrace()
+
+    original_body = str(email.body or "")
+    latest_body, older_body = _split_email_latest_and_context(original_body)
+    if latest_body and older_body:
+        combined = (
+            "LATEST MESSAGE (authoritative, override older values):\n"
+            + latest_body.strip()
+            + "\n\nOLDER CONTEXT (use only if missing in latest):\n"
+            + older_body.strip()
+        ).strip()
+        email = EmailMessage(
+            email_id=email.email_id,
+            sender=email.sender,
+            to=email.to,
+            subject=email.subject,
+            body=combined,
+        )
+        trace.add(
+            "Email Preprocess",
+            summary="Prepared latest-first email view (latest overrides older context).",
+            data={
+                "original_len": len(original_body),
+                "latest_len": len(latest_body),
+                "older_len": len(older_body),
+            },
+        )
 
     trace.add(
         "Load Email",
