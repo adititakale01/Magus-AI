@@ -325,7 +325,21 @@
           <label class="check"><input id="quoteUseOpenai" type="checkbox" />use_openai</label>
           <label class="check"><input id="quoteIncludeTrace" type="checkbox" checked />include_trace</label>
           <label class="check"><input id="quoteEmailAsText" type="checkbox" checked />email as text</label>
+          <label class="check"><input id="quotePersist" type="checkbox" />persist</label>
           <button id="btnFillSample">Fill sample</button>
+        </div>
+
+        <div class="row cols3">
+          <div>
+            <label for="recordStatus">record_status</label>
+            <select id="recordStatus">
+              <option value="needs_human_decision">needs_human_decision</option>
+              <option value="auto_processed">auto_processed</option>
+              <option value="unprocessed">unprocessed</option>
+              <option value="human_confirmed_replied">human_confirmed_replied</option>
+              <option value="human_rejected">human_rejected</option>
+            </select>
+          </div>
         </div>
 
         <div class="row cols2">
@@ -364,6 +378,55 @@
           <pre id="quoteOut"></pre>
         </details>
       </section>
+
+      <section class="card">
+        <h2>Email records (DB)</h2>
+        <div class="row cols3">
+          <div>
+            <label for="recordsLimit">limit</label>
+            <input id="recordsLimit" type="number" min="1" step="1" value="50" />
+          </div>
+          <div>
+            <label for="recordsOffset">offset</label>
+            <input id="recordsOffset" type="number" min="0" step="1" value="0" />
+          </div>
+        </div>
+        <div class="row cols3">
+          <div>
+            <label for="recordId">record_id (for update)</label>
+            <input id="recordId" type="text" placeholder="uuid" />
+          </div>
+          <div>
+            <label for="updateStatus">status</label>
+            <select id="updateStatus">
+              <option value="unprocessed">unprocessed</option>
+              <option value="auto_processed">auto_processed</option>
+              <option value="needs_human_decision">needs_human_decision</option>
+              <option value="human_confirmed_replied">human_confirmed_replied</option>
+              <option value="human_rejected">human_rejected</option>
+            </select>
+          </div>
+          <div>
+            <label for="updateType">type</label>
+            <select id="updateType">
+              <option value="auto">auto</option>
+              <option value="human">human</option>
+            </select>
+          </div>
+        </div>
+        <div class="inline">
+          <button id="btnCreateEmailRecord">Create record (from current email + quote)</button>
+          <button id="btnUpdateEmailRecord">Update status</button>
+          <button id="btnListEmailRecords">List</button>
+          <button id="btnEmailRecordCounts">Status counts</button>
+          <button id="btnNeedsHuman">Needs human decision</button>
+          <span id="recordsStatus" class="pill">idle</span>
+        </div>
+        <details open>
+          <summary>Response JSON</summary>
+          <pre id="recordsOut"></pre>
+        </details>
+      </section>
     </div>
 
     <script>
@@ -399,6 +462,14 @@
           return JSON.stringify(value, null, 2);
         } catch {
           return String(value);
+        }
+      }
+
+      function safeJsonParse(text) {
+        try {
+          return JSON.parse(String(text || ""));
+        } catch {
+          return null;
         }
       }
 
@@ -752,6 +823,8 @@
         $("quoteUseOpenai").checked = false;
         $("quoteIncludeTrace").checked = true;
         $("quoteEmailAsText").checked = true;
+        $("quotePersist").checked = true;
+        $("recordStatus").value = "needs_human_decision";
       });
 
       $("btnQuote").addEventListener("click", async () => {
@@ -764,6 +837,9 @@
         const sop_parse_mode = String($("quoteSopParseMode").value || "auto");
         const force_sop_refresh = Boolean($("quoteForceSopRefresh").checked);
         const include_trace = Boolean($("quoteIncludeTrace").checked);
+        const persist = Boolean($("quotePersist").checked);
+        const record_type = "auto";
+        const record_status = String($("recordStatus").value || "needs_human_decision");
         try {
           const emailId = String($("emailId").value || "").trim() || null;
           const from = String($("emailFrom").value || "").trim();
@@ -797,6 +873,9 @@
             sop_parse_mode,
             force_sop_refresh,
             include_trace,
+            persist,
+            record_type,
+            record_status,
             email_id,
             email,
           });
@@ -804,10 +883,132 @@
           if (r.data && typeof r.data.quote_text === "string") $("quoteText").textContent = r.data.quote_text;
           else $("quoteText").textContent = r.data ? fmt(r.data) : r.text;
           $("quoteOut").textContent = r.data ? fmt(r.data) : r.text;
+          if (r.data && typeof r.data.record_id === "string") $("recordId").value = r.data.record_id;
           setPill($("quoteStatus"), r.ok ? "ok" : "err", String(r.status));
         } catch (e) {
           $("quoteOut").textContent = String(e && e.message ? e.message : e);
           setPill($("quoteStatus"), "err", "error");
+        }
+      });
+
+      $("btnCreateEmailRecord").addEventListener("click", async () => {
+        setPill($("recordsStatus"), "warn", "loading...");
+        $("recordsOut").textContent = "";
+        try {
+          const emailId = String($("emailId").value || "").trim() || null;
+          const from = String($("emailFrom").value || "").trim() || null;
+          const to = String($("emailTo").value || "").trim() || null;
+          const subject = String($("emailSubject").value || "").trim() || null;
+          const bodyText = String($("emailBody").value || "") || null;
+
+          const quoteResp = safeJsonParse($("quoteOut").textContent);
+          const reply = (quoteResp && typeof quoteResp.quote_text === "string" ? quoteResp.quote_text : $("quoteText").textContent) || null;
+          const trace = quoteResp && typeof quoteResp.trace === "object" ? quoteResp.trace : null;
+
+          const type = String($("updateType").value || "auto");
+          const status = String($("updateStatus").value || "unprocessed");
+          const config = {
+            difficulty: String($("quoteDifficulty").value || "easy"),
+            enable_sop: Boolean($("quoteEnableSop").checked),
+            use_openai: Boolean($("quoteUseOpenai").checked),
+            sop_parse_mode: String($("quoteSopParseMode").value || "auto"),
+            force_sop_refresh: Boolean($("quoteForceSopRefresh").checked),
+          };
+
+          const body = JSON.stringify({
+            email_id: emailId,
+            from,
+            to,
+            subject,
+            body: bodyText,
+            reply,
+            trace,
+            type,
+            status,
+            config,
+          });
+
+          const r = await request("/email-records", { method: "POST", headers: { "Content-Type": "application/json" }, body });
+          $("recordsOut").textContent = r.data ? fmt(r.data) : r.text;
+          if (r.data && typeof r.data.id === "string") $("recordId").value = r.data.id;
+          setPill($("recordsStatus"), r.ok ? "ok" : "err", String(r.status));
+        } catch (e) {
+          $("recordsOut").textContent = String(e && e.message ? e.message : e);
+          setPill($("recordsStatus"), "err", "error");
+        }
+      });
+
+      $("btnUpdateEmailRecord").addEventListener("click", async () => {
+        setPill($("recordsStatus"), "warn", "loading...");
+        $("recordsOut").textContent = "";
+        const id = String($("recordId").value || "").trim();
+        if (!id) {
+          setPill($("recordsStatus"), "err", "missing record_id");
+          return;
+        }
+        try {
+          const status = String($("updateStatus").value || "needs_human_decision");
+          const type = String($("updateType").value || "auto");
+          const replyText = String($("quoteText").textContent || "").trim();
+          const payload = { status, type };
+          if (replyText && status === "human_confirmed_replied") payload.reply = replyText;
+
+          const body = JSON.stringify(payload);
+          const r = await request(`/email-records/${encodeURIComponent(id)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body,
+          });
+          $("recordsOut").textContent = r.data ? fmt(r.data) : r.text;
+          setPill($("recordsStatus"), r.ok ? "ok" : "err", String(r.status));
+        } catch (e) {
+          $("recordsOut").textContent = String(e && e.message ? e.message : e);
+          setPill($("recordsStatus"), "err", "error");
+        }
+      });
+
+      $("btnListEmailRecords").addEventListener("click", async () => {
+        setPill($("recordsStatus"), "warn", "loading...");
+        $("recordsOut").textContent = "";
+        const limit = Number($("recordsLimit").value || 50);
+        const offset = Number($("recordsOffset").value || 0);
+        try {
+          const r = await request(`/email-records?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`);
+          $("recordsOut").textContent = r.data ? fmt(r.data) : r.text;
+          setPill($("recordsStatus"), r.ok ? "ok" : "err", String(r.status));
+        } catch (e) {
+          $("recordsOut").textContent = String(e && e.message ? e.message : e);
+          setPill($("recordsStatus"), "err", "error");
+        }
+      });
+
+      $("btnEmailRecordCounts").addEventListener("click", async () => {
+        setPill($("recordsStatus"), "warn", "loading...");
+        $("recordsOut").textContent = "";
+        try {
+          const r = await request("/email-records/status-counts");
+          $("recordsOut").textContent = r.data ? fmt(r.data) : r.text;
+          setPill($("recordsStatus"), r.ok ? "ok" : "err", String(r.status));
+        } catch (e) {
+          $("recordsOut").textContent = String(e && e.message ? e.message : e);
+          setPill($("recordsStatus"), "err", "error");
+        }
+      });
+
+      $("btnNeedsHuman").addEventListener("click", async () => {
+        setPill($("recordsStatus"), "warn", "loading...");
+        $("recordsOut").textContent = "";
+        const limit = Number($("recordsLimit").value || 50);
+        const offset = Number($("recordsOffset").value || 0);
+        try {
+          const r = await request(
+            `/email-records/needs-human-decision?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`
+          );
+          $("recordsOut").textContent = r.data ? fmt(r.data) : r.text;
+          setPill($("recordsStatus"), r.ok ? "ok" : "err", String(r.status));
+        } catch (e) {
+          $("recordsOut").textContent = String(e && e.message ? e.message : e);
+          setPill($("recordsStatus"), "err", "error");
         }
       });
     </script>

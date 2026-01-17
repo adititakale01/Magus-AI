@@ -20,6 +20,9 @@ EXTRACTION_SYSTEM_PROMPT = (
     "  ],\n"
     '  "clarification_questions": [string]\n'
     "}\n"
+    "Use the `notes` field ONLY for special requests or non-standard constraints that may require special handling\n"
+    "(e.g., DDP/DAP/DDU, customs clearance, insurance, dangerous goods, lithium batteries, temperature control, urgency/deadlines,\n"
+    "documentation requirements). If none, set notes to null.\n"
     "If an email contains multiple routes, return multiple shipments.\n"
     "If info is missing, use null and add a clarification question.\n"
     "Do not invent values."
