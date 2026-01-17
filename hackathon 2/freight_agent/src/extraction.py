@@ -14,7 +14,7 @@ from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from .models import Email, Shipment, ExtractionResult
+from models import Email, Shipment, ExtractionResult
 
 
 # Load environment variables
