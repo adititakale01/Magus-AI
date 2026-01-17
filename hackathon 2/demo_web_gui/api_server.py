@@ -538,6 +538,13 @@ def create_app() -> FastAPI:
         out: dict[str, Any] = {
             "quote_text": result.quote_text,
             "error": result.error,
+            "email": {
+                "email_id": email.email_id,
+                "from": email.sender,
+                "to": email.to,
+                "subject": email.subject,
+                "body": email.body,
+            },
         }
 
         if payload.include_trace:

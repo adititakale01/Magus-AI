@@ -191,6 +191,13 @@ Body (two supported formats):
 Response (abridged):
 ```json
 {
+  "email": {
+    "email_id": "email_api",
+    "from": "sarah.chen@globalimports.com",
+    "to": "quotes@freightco.com",
+    "subject": "Quote Request",
+    "body": "..."
+  },
   "quote_text": "Hi,\\n\\nThank you ...",
   "error": null,
   "trace": { "llm_usage": { "calls": 2, "total_tokens": 1234 }, "steps": [ ... ] }
