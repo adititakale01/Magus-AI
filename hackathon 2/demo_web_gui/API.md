@@ -9,6 +9,8 @@ This service exposes the demo pipeline as a JSON API for a separate frontend.
 
 API tester UI: `hackathon 2/demo_web_gui/api_tester/index.html`
 
+ngrok (SDK): `hackathon 2/demo_web_gui/run_with_ngrok.py` (reads `NGROK_AUTHTOKEN`)
+
 ## Auth / OpenAI key
 - **Header:** `X-OpenAI-Api-Key: <your-openai-key>`
 - **Alias (optional):** `X-API-Key: <your-openai-key>`

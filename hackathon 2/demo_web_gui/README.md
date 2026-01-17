@@ -34,6 +34,16 @@ python -m uvicorn api_server:app --host 0.0.0.0 --port 8000
 - API docs: `hackathon 2/demo_web_gui/API.md`
 - Base URL: `http://localhost:8000/api/v1`
 
+## Expose via ngrok (Python SDK)
+If `ngrok http 8000` is not working on your machine, you can use the ngrok Python SDK instead.
+
+From the `hackathon 2/demo_web_gui/` folder:
+```powershell
+$env:NGROK_AUTHTOKEN = "<your-token>"
+python run_with_ngrok.py
+```
+It prints the public base URL (and keeps running until Ctrl+C).
+
 ## API tester UI (static frontend)
 Run from the `hackathon 2/demo_web_gui/` folder:
 ```bash
