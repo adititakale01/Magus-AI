@@ -114,7 +114,10 @@ def process_email(
     # STEP 7: RESPONSE FORMATTING (GPT #3)
     # =========================================================================
     print("[Pipeline] Step 7: Formatting response...")
-    response = format_response_sync(quote, email, openai_client)
+    response = format_response_sync(
+        quote, email, openai_client,
+        validation_errors=list(enriched.validation_errors)
+    )
     print("[Pipeline] Response generated!")
 
     # Calculate confidence score
@@ -246,7 +249,8 @@ def process_email_streaming(
 
     # Get streaming iterator and result getter
     stream, get_result = format_response_streaming_with_result(
-        quote, email, openai_client
+        quote, email, openai_client,
+        validation_errors=list(enriched.validation_errors)
     )
 
     # Stream chunks to callback

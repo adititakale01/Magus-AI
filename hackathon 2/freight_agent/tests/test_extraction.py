@@ -7,10 +7,10 @@ Run from the freight_agent directory:
 import sys
 from pathlib import Path
 
-# Add freight_agent to path (parent of tests/)
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add src directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from src.extraction import extract_from_file
+from extraction import extract_from_file
 
 # Paths
 DATA_DIR = Path(__file__).parent.parent.parent / "hackathon_data"

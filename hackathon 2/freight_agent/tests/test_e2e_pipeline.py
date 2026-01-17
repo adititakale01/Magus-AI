@@ -21,9 +21,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from extraction import load_email, extract_from_email
+from enrichment import enrich_request
 from rate_lookup import RateLookupService
 from quote_calculator import calculate_quote
 from models import EnrichedRequest, EnrichedShipment, CustomerSOP, Shipment
+
+# Flag to switch between mock and real SOPs
+USE_REAL_SOPS = True  # Set to False to use mocked 15% margin (faster, no Qontext)
 
 
 # ============================================================================
@@ -33,7 +37,10 @@ from models import EnrichedRequest, EnrichedShipment, CustomerSOP, Shipment
 BASE_DIR = Path(__file__).parent.parent.parent / "hackathon_data"
 EMAILS_DIR = BASE_DIR / "emails"
 RATE_SHEETS_DIR = BASE_DIR / "rate_sheets"
-SOLUTIONS_DIR = BASE_DIR / "solutions"
+
+# Solutions directory - use SOP-based solutions when USE_REAL_SOPS is True
+SOLUTIONS_DIR_MOCK = BASE_DIR / "solutions"  # Original (15% margin, no discounts)
+SOLUTIONS_DIR_REAL = BASE_DIR / "solutions_with_sops"  # Real SOP calculations
 
 # Use easy rate sheet for testing (solutions are based on this)
 RATE_SHEET = RATE_SHEETS_DIR / "01_rates_easy.xlsx"
@@ -188,7 +195,8 @@ def run_single_test(email_num: int, rate_service: RateLookupService) -> dict:
     Returns dict with test results.
     """
     email_path = EMAILS_DIR / f"email_{email_num:02d}.json"
-    solution_path = SOLUTIONS_DIR / f"solution_email_{email_num:02d}.md"
+    solutions_dir = SOLUTIONS_DIR_REAL if USE_REAL_SOPS else SOLUTIONS_DIR_MOCK
+    solution_path = solutions_dir / f"solution_email_{email_num:02d}.md"
 
     # Load email and solution
     email = load_email(email_path)
@@ -228,8 +236,26 @@ def run_single_test(email_num: int, rate_service: RateLookupService) -> dict:
         result["errors"].append("No shipments extracted")
         return result
 
-    # Create mock enriched request (without GPT call)
-    enriched = create_mock_enriched_request(extraction, email)
+    # Step 3-4: Enrichment (real or mock)
+    if USE_REAL_SOPS:
+        # Real enrichment - calls Qontext for actual customer SOPs
+        enriched = enrich_request(extraction)
+        result["customer_name"] = enriched.customer_name
+        result["sop"] = {
+            "margin_percent": enriched.customer_sop.margin_percent,
+            "flat_discount_percent": enriched.customer_sop.flat_discount_percent,
+            "volume_discount_tiers": enriched.customer_sop.volume_discount_tiers,
+            "mode_restriction": enriched.customer_sop.mode_restriction,
+        }
+        result["validation_errors"] = [
+            {"type": e.error_type, "message": e.message}
+            for e in enriched.validation_errors
+        ]
+    else:
+        # Mock enrichment - 15% margin, no discounts (faster, no Qontext)
+        enriched = create_mock_enriched_request(extraction, email)
+        result["customer_name"] = "Test Customer (mocked)"
+        result["sop"] = {"margin_percent": 15.0, "note": "mocked"}
 
     # Step 5: Rate lookup
     rate_matches = []
@@ -284,12 +310,15 @@ def run_single_test(email_num: int, rate_service: RateLookupService) -> dict:
 def run_all_tests():
     """Run tests for all 10 emails and print results."""
 
+    solutions_dir = SOLUTIONS_DIR_REAL if USE_REAL_SOPS else SOLUTIONS_DIR_MOCK
+
     print("\n" + "=" * 70)
     print("FREIGHT QUOTE AGENT - END-TO-END TESTS")
     print("=" * 70)
     print(f"\nEmails:     {EMAILS_DIR}")
     print(f"Rate Sheet: {RATE_SHEET}")
-    print(f"Solutions:  {SOLUTIONS_DIR}")
+    print(f"Solutions:  {solutions_dir}")
+    print(f"SOP Mode:   {'REAL (Qontext)' if USE_REAL_SOPS else 'MOCKED (15% margin)'}")
     print("=" * 70)
 
     # Load rate service once
@@ -321,6 +350,21 @@ def run_all_tests():
                 print(f"  Type: Incomplete request")
                 print(f"  Detected: {result['actual_incomplete']}")
             else:
+                # Show customer and SOP info when using real SOPs
+                if result.get("customer_name"):
+                    print(f"  Customer: {result['customer_name']}")
+                if result.get("sop") and USE_REAL_SOPS:
+                    sop = result["sop"]
+                    sop_info = f"margin={sop.get('margin_percent')}%"
+                    if sop.get("flat_discount_percent"):
+                        sop_info += f", discount={sop['flat_discount_percent']}%"
+                    if sop.get("mode_restriction"):
+                        sop_info += f", mode={sop['mode_restriction']}"
+                    print(f"  SOP: {sop_info}")
+                if result.get("validation_errors"):
+                    for verr in result["validation_errors"]:
+                        print(f"  [!] {verr['type']}: {verr['message']}")
+
                 print(f"  Expected: ${result['expected_total']:.2f}" if result['expected_total'] else "  Expected: N/A")
                 print(f"  Actual:   ${result['actual_total']:.2f}" if result['actual_total'] else "  Actual: N/A")
 

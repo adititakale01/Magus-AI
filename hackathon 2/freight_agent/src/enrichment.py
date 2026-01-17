@@ -1,13 +1,13 @@
 """
-Enrichment v2: Batched + Tool Calling
+Enrichment v2: Local SOP First + Qontext Validation
 
-This module handles enrichment AND validation in a single GPT call:
-1. Batch all Qontext queries (REST API, no GPT cost)
-2. Single GPT call to parse ALL context
-3. GPT calls validate_shipment tool for deterministic checks
+This module handles enrichment AND validation:
+1. LOCAL SOP lookup first (fast, reliable, deterministic)
+2. Optional Qontext call for comparison (logs discrepancies)
+3. GPT call for validation tool calling
 4. GPT handles fuzzy matching (names, locations)
 
-Optimized from 3+ GPT calls to just 1!
+The local SOP is the source of truth - Qontext is only for validation/logging.
 """
 import json
 import os
@@ -24,9 +24,29 @@ from models import (
     ValidationWarning,
 )
 from qontext_client import QontextClient
+from local_sop import (
+    lookup_sop,
+    lookup_sop_with_surcharges,
+    get_destination_surcharges,
+    compare_with_qontext,
+)
 
 # Load environment variables
 load_dotenv()
+
+# =============================================================================
+# CONFIGURATION FLAGS
+# =============================================================================
+
+# Use local SOP as primary source (recommended for reliability)
+USE_LOCAL_SOP = True
+
+# Query Qontext for KNOWN customers only (for comparison/logging)
+# Skipped for: unknown customers, destination surcharges
+QONTEXT_FOR_KNOWN_CUSTOMERS = True
+
+# Log discrepancies between local and Qontext
+LOG_DISCREPANCIES = True
 
 
 # ============================================================================
@@ -315,32 +335,164 @@ def collect_qontext_context(
 def enrich_request(
     extraction: ExtractionResult,
     openai_client: OpenAI | None = None,
-    qontext_client: QontextClient | None = None
+    qontext_client: QontextClient | None = None,
+    use_local_sop: bool | None = None,
 ) -> EnrichedRequest:
     """
-    Enrich and validate an extraction result in a single GPT call.
+    Enrich and validate an extraction result.
 
     This is the main entry point - combines enrichment + validation.
+
+    HYBRID STRATEGY:
+    1. LOCAL SOP is always the source of truth (fast, reliable, deterministic)
+    2. For KNOWN customers only: also query Qontext for comparison/logging
+    3. For UNKNOWN customers: skip Qontext entirely (can't help)
+    4. For DESTINATIONS: always use local (Qontext semantic matching is bad)
 
     Args:
         extraction: The extraction result from Step 1+2
         openai_client: Optional OpenAI client
         qontext_client: Optional Qontext client
+        use_local_sop: Override for USE_LOCAL_SOP flag (None = use global setting)
 
     Returns:
         EnrichedRequest with customer info, SOPs, surcharges, AND validation results
     """
-    # Initialize clients
+    # Determine which SOP source to use
+    should_use_local = use_local_sop if use_local_sop is not None else USE_LOCAL_SOP
+
+    # Initialize clients lazily (only if needed)
     if openai_client is None:
         openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    if qontext_client is None:
-        qontext_client = QontextClient()
 
-    # Step 1: Fast internal customer lookup (no Qontext needed!)
-    customer_name = get_customer_by_domain(extraction.sender_email)
+    # =========================================================================
+    # STEP 1: LOCAL SOP LOOKUP (fast, reliable, source of truth)
+    # =========================================================================
+    destinations = [s.destination_raw for s in extraction.shipments if s.destination_raw]
+    local_customer_name, local_sop, local_surcharges = lookup_sop_with_surcharges(
+        extraction.sender_email,
+        destinations
+    )
 
-    # Step 2: Get SOP rules and surcharges from Qontext
-    context = collect_qontext_context(extraction, qontext_client, customer_name)
+    # Check if this is a KNOWN customer (one of the 5 in local_sop.py)
+    is_known_customer = local_customer_name != "Unknown Customer"
+
+    if should_use_local:
+        print(f"[Enrichment] Using LOCAL SOP for: {local_customer_name}")
+        customer_name = local_customer_name
+        customer_sop = local_sop
+        # Build surcharges per shipment based on destination (ALWAYS local - Qontext is unreliable)
+        shipment_surcharges = []
+        for shipment in extraction.shipments:
+            dest_surcharges = get_destination_surcharges(shipment.destination_raw or "")
+            shipment_surcharges.append(dest_surcharges)
+    else:
+        # Use Qontext (legacy behavior)
+        customer_name = get_customer_by_domain(extraction.sender_email)
+        print(f"[Enrichment] Using QONTEXT for: {customer_name or 'Unknown'}")
+
+    # =========================================================================
+    # STEP 2: QONTEXT COMPARISON (only for KNOWN customers)
+    # =========================================================================
+    context = {"sop_context": [], "surcharge_context": {}}
+
+    if QONTEXT_FOR_KNOWN_CUSTOMERS and is_known_customer and should_use_local:
+        # Query Qontext for known customer SOPs (for comparison/logging only)
+        if qontext_client is None:
+            qontext_client = QontextClient()
+
+        print(f"[Enrichment] Querying Qontext for comparison: {local_customer_name}")
+        try:
+            # Only get SOP rules, NOT destination surcharges (local is better for those)
+            sop_response = qontext_client.retrieve(
+                f"What are all the rules, discounts, restrictions, and requirements for {local_customer_name}?",
+                limit=15,
+                depth=2
+            )
+            if sop_response.success:
+                context["sop_context"] = sop_response.context
+
+                # Log that we got Qontext data (discrepancy check happens later if needed)
+                if LOG_DISCREPANCIES:
+                    print(f"[Enrichment] Qontext returned {len(sop_response.context)} context items for comparison")
+        except Exception as e:
+            print(f"[Enrichment] Qontext query failed (using local anyway): {e}")
+
+    elif not is_known_customer:
+        print(f"[Enrichment] Skipping Qontext for unknown customer (local defaults used)")
+
+    # =========================================================================
+    # STEP 3: LOCAL-ONLY PATH (skip GPT entirely if using local SOP)
+    # =========================================================================
+    if should_use_local:
+        # Do validation locally - no GPT needed!
+        validation_errors = []
+
+        for i, shipment in enumerate(extraction.shipments):
+            # Normalize origin for comparison
+            origin = (shipment.origin_raw or "").lower().strip()
+            normalized_origin = origin
+
+            # Normalize common aliases (check if any alias is CONTAINED in the origin)
+            hcmc_aliases = ["hcmc", "saigon", "ho chi minh city", "ho chi minh", "sgn", "hcm"]
+            if any(alias in origin for alias in hcmc_aliases):
+                normalized_origin = "hcmc"
+            elif any(alias in origin for alias in ["pudong", "pvg"]):
+                normalized_origin = "shanghai"
+            elif any(alias in origin for alias in ["ningbo", "ningpo"]):
+                normalized_origin = "ningbo"
+
+            # Check mode restriction
+            if local_sop.mode_restriction:
+                if shipment.mode and shipment.mode != local_sop.mode_restriction:
+                    validation_errors.append(ValidationError(
+                        error_type="mode_restriction",
+                        message=f"Per your account agreement, {local_customer_name} is set up for {local_sop.mode_restriction} freight only.",
+                        suggestion=f"Would you like a {local_sop.mode_restriction} freight quote instead?",
+                        shipment_index=i
+                    ))
+
+            # Check origin restriction
+            if local_sop.origin_restriction:
+                if normalized_origin.upper() != local_sop.origin_restriction.upper():
+                    validation_errors.append(ValidationError(
+                        error_type="origin_restriction",
+                        message=f"Per your account agreement, {local_customer_name} shipments must originate from {local_sop.origin_restriction.upper()}.",
+                        suggestion=f"Would you like a quote from {local_sop.origin_restriction.upper()} instead?",
+                        shipment_index=i
+                    ))
+
+        # Build enriched shipments with local surcharges
+        enriched_shipments = []
+        for i, shipment in enumerate(extraction.shipments):
+            surcharges = tuple(shipment_surcharges[i]) if i < len(shipment_surcharges) else ()
+            enriched_shipments.append(EnrichedShipment(shipment=shipment, surcharges=surcharges))
+
+        # Determine overall validity
+        if validation_errors:
+            errored_shipments = {e.shipment_index for e in validation_errors if e.shipment_index is not None}
+            valid_count = len(extraction.shipments) - len(errored_shipments)
+            is_valid = valid_count > 0
+        else:
+            is_valid = True
+
+        print(f"[Enrichment] LOCAL validation complete: {len(validation_errors)} errors found")
+
+        return EnrichedRequest(
+            sender_email=extraction.sender_email,
+            customer_name=local_customer_name,
+            customer_sop=local_sop,
+            shipments=tuple(enriched_shipments),
+            is_valid=is_valid,
+            validation_errors=tuple(validation_errors),
+            validation_warnings=(),
+            missing_fields=extraction.missing_fields,
+            needs_clarification=extraction.needs_clarification
+        )
+
+    # =========================================================================
+    # STEP 4: QONTEXT PATH (legacy - uses GPT to parse Qontext context)
+    # =========================================================================
 
     # Step 3: Build the prompt with all context
     shipments_info = []

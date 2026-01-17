@@ -45,6 +45,22 @@ When explaining pricing, ALWAYS reference the customer's account agreement:
 - Use phrases like "per your account agreement" or "as per your SOP" when referencing special pricing
 - The sop_summary field provides context about the customer's account terms
 
+## REJECTION HANDLING (CRITICAL):
+When the quote has validation_errors or is rejected, you MUST:
+1. CLEARLY STATE THE REASON for rejection at the start of the email (after greeting)
+2. Reference the specific policy violation using the exact message from validation_errors
+3. Use the SUGGESTION provided in the validation error to offer alternatives
+4. Be empathetic but firm about policy requirements
+
+Example rejection structure:
+"Unfortunately, I'm unable to provide an air freight quote for this request. Per your account agreement,
+[Customer Name] is set up for sea freight only. [Suggestion from error]"
+
+NEVER:
+- Give a vague "we can't help" response without explaining WHY
+- Skip mentioning the validation errors
+- Apologize excessively - be professional and solution-oriented
+
 ## TONE GUIDELINES:
 - Match the formality of the customer's original email
 - Casual request (typos, informal language) → friendly but professional response
@@ -67,9 +83,9 @@ Return ONLY the email body text. Do not include subject line or metadata.
 """
 
 
-def _quote_to_dict(quote: Quote) -> dict:
+def _quote_to_dict(quote: Quote, validation_errors: list = None) -> dict:
     """Convert Quote to a JSON-serializable dict for the prompt."""
-    return {
+    result = {
         "customer_name": quote.customer_name,
         "customer_email": quote.customer_email,
         "sop_summary": quote.sop_summary,  # SOP context for referencing in response
@@ -101,12 +117,31 @@ def _quote_to_dict(quote: Quote) -> dict:
         "has_errors": quote.has_errors,
     }
 
+    # Add validation errors if present (SOP violations, etc.)
+    if validation_errors:
+        result["validation_errors"] = [
+            {
+                "error_type": err.error_type,
+                "message": err.message,
+                "suggestion": err.suggestion,
+                "shipment_index": err.shipment_index,
+            }
+            for err in validation_errors
+        ]
+        result["is_rejected"] = True
+    else:
+        result["validation_errors"] = []
+        result["is_rejected"] = False
+
+    return result
+
 
 async def format_response(
     quote: Quote,
     original_email: Email,
     client: AsyncOpenAI,
     model: str = "gpt-4o-mini",
+    validation_errors: list = None,
 ) -> QuoteResponse:
     """
     GPT call #3: Generate natural email response from structured quote.
@@ -116,6 +151,7 @@ async def format_response(
         original_email: The original customer email for context/tone matching
         client: OpenAI async client
         model: Model to use (default: gpt-4o-mini)
+        validation_errors: List of ValidationError objects (SOP violations, etc.)
 
     Returns:
         QuoteResponse with subject and body
@@ -129,7 +165,7 @@ async def format_response(
     )
 
     # Build user prompt with email and quote data
-    quote_json = json.dumps(_quote_to_dict(quote), indent=2)
+    quote_json = json.dumps(_quote_to_dict(quote, validation_errors), indent=2)
     user_prompt = f"""
 ## ORIGINAL EMAIL FROM CUSTOMER:
 From: {original_email.sender}
@@ -173,9 +209,13 @@ def format_response_sync(
     original_email: Email,
     client,  # Regular OpenAI client
     model: str = "gpt-4o-mini",
+    validation_errors: list = None,
 ) -> QuoteResponse:
     """
     Synchronous version of format_response for non-async contexts.
+
+    Args:
+        validation_errors: List of ValidationError objects (SOP violations, etc.)
     """
     # Build system prompt with display flags
     system_prompt = FORMATTER_SYSTEM_PROMPT.format(
@@ -186,7 +226,7 @@ def format_response_sync(
     )
 
     # Build user prompt with email and quote data
-    quote_json = json.dumps(_quote_to_dict(quote), indent=2)
+    quote_json = json.dumps(_quote_to_dict(quote, validation_errors), indent=2)
     user_prompt = f"""
 ## ORIGINAL EMAIL FROM CUSTOMER:
 From: {original_email.sender}
@@ -228,6 +268,7 @@ def format_response_streaming(
     original_email: Email,
     client,  # Regular OpenAI client
     model: str = "gpt-4o-mini",
+    validation_errors: list = None,
 ):
     """
     Streaming version of format_response for real-time output.
@@ -240,6 +281,7 @@ def format_response_streaming(
         original_email: The original customer email for context/tone matching
         client: OpenAI client (sync)
         model: Model to use (default: gpt-4o-mini)
+        validation_errors: List of ValidationError objects (SOP violations, etc.)
 
     Yields:
         str: Chunks of the response body as they arrive
@@ -257,7 +299,7 @@ def format_response_streaming(
     )
 
     # Build user prompt with email and quote data
-    quote_json = json.dumps(_quote_to_dict(quote), indent=2)
+    quote_json = json.dumps(_quote_to_dict(quote, validation_errors), indent=2)
     user_prompt = f"""
 ## ORIGINAL EMAIL FROM CUSTOMER:
 From: {original_email.sender}
@@ -309,6 +351,7 @@ def format_response_streaming_with_result(
     original_email: Email,
     client,
     model: str = "gpt-4o-mini",
+    validation_errors: list = None,
 ) -> tuple[callable, callable]:
     """
     Convenience wrapper that returns both a streaming iterator and a way to get the final result.
@@ -325,7 +368,7 @@ def format_response_streaming_with_result(
     result_holder = {"response": None}
 
     def stream():
-        gen = format_response_streaming(quote, original_email, client, model)
+        gen = format_response_streaming(quote, original_email, client, model, validation_errors)
         try:
             while True:
                 yield next(gen)
