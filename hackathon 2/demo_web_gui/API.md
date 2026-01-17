@@ -156,7 +156,9 @@ Notes:
 ### Quote: generate the reply text for an email request
 `POST /api/v1/quote`
 
-Body:
+Body (two supported formats):
+
+1) Structured (legacy):
 ```json
 {
   "difficulty": "easy",
@@ -168,6 +170,19 @@ Body:
     "subject": "Quote Request",
     "body": "..."
   },
+  "force_sop_refresh": false,
+  "include_trace": true
+}
+```
+
+2) Raw email text (recommended for frontend): the server parses `From:` / `To:` / `Subject:` and uses the rest as body.
+```json
+{
+  "difficulty": "easy",
+  "enable_sop": true,
+  "use_openai": true,
+  "email_id": "optional-string",
+  "email": "From: sarah.chen@globalimports.com\\nTo: quotes@freightco.com\\nSubject: Quote Request\\n\\nHi team, ...",
   "force_sop_refresh": false,
   "include_trace": true
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+import re
 import sys
 import threading
 from typing import Any, Literal
@@ -58,7 +59,8 @@ class QuoteRequest(BaseModel):
     difficulty: Difficulty
     enable_sop: bool = False
     use_openai: bool = False
-    email: EmailPayload
+    email: EmailPayload | str
+    email_id: str | None = None
     sop_parse_mode: SopParseModeLiteral = "auto"
     force_sop_refresh: bool = False
     include_trace: bool = True
@@ -121,6 +123,72 @@ def _get_openai_key(
     if x_api_key and str(x_api_key).strip():
         return str(x_api_key).strip()
     return None
+
+
+_HEADER_LINE_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)\s*:\s*(.*)$")
+
+
+def _parse_raw_email_text(raw: str) -> dict[str, str]:
+    text = str(raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.strip("\n")
+    if not text.strip():
+        return {"from": "", "to": "", "subject": "", "body": ""}
+
+    lines = text.split("\n")
+
+    header_lines: list[str] = []
+    body_start_idx: int | None = None
+
+    for idx, line in enumerate(lines):
+        if idx == 0 and not _HEADER_LINE_RE.match(line):
+            body_start_idx = 0
+            break
+
+        if not line.strip():
+            body_start_idx = idx + 1
+            break
+
+        if _HEADER_LINE_RE.match(line) or (line.startswith(" ") or line.startswith("\t")):
+            header_lines.append(line)
+            continue
+
+        body_start_idx = idx
+        break
+
+    if body_start_idx is None:
+        body_start_idx = len(lines)
+
+    headers: dict[str, str] = {}
+    current_key: str | None = None
+    for line in header_lines:
+        if (line.startswith(" ") or line.startswith("\t")) and current_key:
+            headers[current_key] = (headers[current_key] + " " + line.strip()).strip()
+            continue
+
+        m = _HEADER_LINE_RE.match(line)
+        if not m:
+            continue
+        key = str(m.group(1) or "").strip().casefold()
+        value = str(m.group(2) or "").strip()
+        if not key:
+            continue
+        if key in headers and value:
+            headers[key] = f"{headers[key]}, {value}"
+        else:
+            headers[key] = value
+        current_key = key
+
+    has_any_expected_header = any(headers.get(k) for k in ("from", "to", "subject"))
+    if not has_any_expected_header:
+        return {"from": "", "to": "", "subject": "", "body": text}
+
+    body = "\n".join(lines[body_start_idx:]).strip("\n")
+    return {
+        "from": str(headers.get("from") or ""),
+        "to": str(headers.get("to") or ""),
+        "subject": str(headers.get("subject") or ""),
+        "body": body,
+    }
 
 
 def _df_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
@@ -437,14 +505,25 @@ def create_app() -> FastAPI:
             )
             sop_cfg = sop_parse.sop_config
 
-        email_id = payload.email.email_id or "email_api"
-        email = EmailMessage(
-            email_id=email_id,
-            sender=payload.email.from_,
-            to=payload.email.to,
-            subject=payload.email.subject,
-            body=payload.email.body,
-        )
+        if isinstance(payload.email, EmailPayload):
+            email_id = payload.email.email_id or payload.email_id or "email_api"
+            email = EmailMessage(
+                email_id=email_id,
+                sender=payload.email.from_,
+                to=payload.email.to,
+                subject=payload.email.subject,
+                body=payload.email.body,
+            )
+        else:
+            parsed = _parse_raw_email_text(str(payload.email or ""))
+            email_id = payload.email_id or "email_api"
+            email = EmailMessage(
+                email_id=email_id,
+                sender=parsed.get("from", ""),
+                to=parsed.get("to", ""),
+                subject=parsed.get("subject", ""),
+                body=parsed.get("body", ""),
+            )
 
         result = run_quote_pipeline(
             email=email,

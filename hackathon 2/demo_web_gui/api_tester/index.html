@@ -324,6 +324,7 @@
           <label class="check"><input id="quoteEnableSop" type="checkbox" />enable_sop</label>
           <label class="check"><input id="quoteUseOpenai" type="checkbox" />use_openai</label>
           <label class="check"><input id="quoteIncludeTrace" type="checkbox" checked />include_trace</label>
+          <label class="check"><input id="quoteEmailAsText" type="checkbox" checked />email as text</label>
           <button id="btnFillSample">Fill sample</button>
         </div>
 
@@ -413,6 +414,18 @@
         return base + (p.startsWith("/") ? p : "/" + p);
       }
 
+      function maybeBypassNgrokBrowserWarning(url) {
+        try {
+          const u = new URL(url);
+          if (u.hostname.includes("ngrok-free") && !u.searchParams.has("ngrok-skip-browser-warning")) {
+            u.searchParams.set("ngrok-skip-browser-warning", "true");
+          }
+          return u.toString();
+        } catch {
+          return url;
+        }
+      }
+
       function setPill(el, kind, text) {
         el.className = "pill";
         if (kind) el.classList.add(kind);
@@ -429,7 +442,7 @@
         hdrs.set("Accept", "application/json");
         if (key) hdrs.set("X-OpenAI-Api-Key", key);
 
-        const url = apiUrl(path);
+        const url = maybeBypassNgrokBrowserWarning(apiUrl(path));
         const resp = await fetch(url, { method, headers: hdrs, body });
         const text = await resp.text();
         const ct = resp.headers.get("content-type") || "";
@@ -738,6 +751,7 @@
         $("quoteEnableSop").checked = true;
         $("quoteUseOpenai").checked = false;
         $("quoteIncludeTrace").checked = true;
+        $("quoteEmailAsText").checked = true;
       });
 
       $("btnQuote").addEventListener("click", async () => {
@@ -750,14 +764,32 @@
         const sop_parse_mode = String($("quoteSopParseMode").value || "auto");
         const force_sop_refresh = Boolean($("quoteForceSopRefresh").checked);
         const include_trace = Boolean($("quoteIncludeTrace").checked);
-        const email = {
-          email_id: String($("emailId").value || "").trim() || null,
-          from: String($("emailFrom").value || "").trim(),
-          to: String($("emailTo").value || "").trim(),
-          subject: String($("emailSubject").value || "").trim(),
-          body: String($("emailBody").value || ""),
-        };
         try {
+          const emailId = String($("emailId").value || "").trim() || null;
+          const from = String($("emailFrom").value || "").trim();
+          const to = String($("emailTo").value || "").trim();
+          const subject = String($("emailSubject").value || "").trim();
+          const bodyText = String($("emailBody").value || "");
+
+          const sendAsText = Boolean($("quoteEmailAsText").checked);
+          let email;
+          let email_id = emailId;
+
+          if (sendAsText) {
+            let raw = bodyText;
+            if (!/^\s*(from|to|subject)\s*:/i.test(raw)) {
+              const headers = [];
+              if (from) headers.push(`From: ${from}`);
+              if (to) headers.push(`To: ${to}`);
+              if (subject) headers.push(`Subject: ${subject}`);
+              raw = headers.length ? headers.join("\n") + "\n\n" + bodyText : bodyText;
+            }
+            email = raw;
+          } else {
+            email = { email_id, from, to, subject, body: bodyText };
+            email_id = null;
+          }
+
           const body = JSON.stringify({
             difficulty,
             enable_sop,
@@ -765,6 +797,7 @@
             sop_parse_mode,
             force_sop_refresh,
             include_trace,
+            email_id,
             email,
           });
           const r = await request("/quote", { method: "POST", headers: { "Content-Type": "application/json" }, body });
