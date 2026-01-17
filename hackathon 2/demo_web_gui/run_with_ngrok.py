@@ -28,6 +28,25 @@ def _wait_port(host: str, port: int, timeout_s: float = 10.0) -> None:
     raise TimeoutError(f"Timed out waiting for {host}:{port} to accept connections.")
 
 
+def _listener_url(listener: object) -> str:
+    value = getattr(listener, "url", None)
+    if callable(value):
+        try:
+            value = value()
+        except Exception:
+            value = None
+    if value is not None:
+        return str(value)
+
+    value = getattr(listener, "public_url", None)
+    if callable(value):
+        try:
+            value = value()
+        except Exception:
+            value = None
+    return str(value) if value is not None else ""
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the API server and expose it via ngrok (Python SDK).")
     parser.add_argument("--host", default=os.getenv("API_HOST", "127.0.0.1"))
@@ -74,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
             server.should_exit = True
         return 1
 
-    public = str(getattr(listener, "url", "") or "").rstrip("/")
+    public = _listener_url(listener).rstrip("/")
     print(f"ngrok URL: {public}")
     print(f"API base: {public}/api/v1")
     print(f"Docs: {public}/docs")
