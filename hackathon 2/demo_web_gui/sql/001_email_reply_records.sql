@@ -19,6 +19,7 @@ create table if not exists public.email_quote_records (
 
     type text not null default 'auto',
     status text not null default 'unprocessed',
+    confidence text null,
     config jsonb null,
 
     origin_city text null,
@@ -28,6 +29,9 @@ create table if not exists public.email_quote_records (
     transport_type text null,
     has_route boolean null
 );
+
+alter table public.email_quote_records
+    add column if not exists confidence text null;
 
 alter table public.email_quote_records
     add column if not exists origin_city text null;
@@ -48,6 +52,15 @@ begin
         alter table public.email_quote_records
             add constraint email_quote_records_type_chk
             check (type in ('auto', 'human'));
+    end if;
+end $$;
+
+do $$
+begin
+    if not exists (select 1 from pg_constraint where conname = 'email_quote_records_confidence_chk') then
+        alter table public.email_quote_records
+            add constraint email_quote_records_confidence_chk
+            check (confidence is null or confidence in ('high', 'medium', 'low'));
     end if;
 end $$;
 

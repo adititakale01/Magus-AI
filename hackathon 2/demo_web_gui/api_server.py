@@ -50,6 +50,7 @@ EmailRecordStatusLiteral = Literal[
     "human_confirmed_replied",
     "human_rejected",
 ]
+ConfidenceLiteral = Literal["high", "medium", "low"]
 
 
 class EmailPayload(BaseModel):
@@ -96,6 +97,7 @@ class EmailRecordCreateRequest(BaseModel):
     trace: dict[str, Any] | None = None
     type: EmailRecordTypeLiteral = "auto"
     status: EmailRecordStatusLiteral = "unprocessed"
+    confidence: ConfidenceLiteral | None = None
     config: dict[str, Any] | None = None
 
     model_config = {"populate_by_name": True}
@@ -106,6 +108,7 @@ class EmailRecordUpdateRequest(BaseModel):
     type: EmailRecordTypeLiteral | None = None
     reply: str | None = None
     trace: dict[str, Any] | None = None
+    confidence: ConfidenceLiteral | None = None
     config: dict[str, Any] | None = None
 
 
@@ -148,6 +151,27 @@ _SPECIAL_REQUEST_KEYWORDS = [
     r"\basap\b",
     r"\bdeadline\b",
 ]
+
+_COMMON_GENERIC_EMAIL_DOMAINS = {
+    "163.com",
+    "126.com",
+    "qq.com",
+    "foxmail.com",
+    "sina.com",
+    "gmail.com",
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "msn.com",
+    "yahoo.com",
+    "icloud.com",
+    "gmx.com",
+    "aol.com",
+    "proton.me",
+    "protonmail.com",
+    "yandex.com",
+    "yandex.ru",
+}
 
 
 def _resolve_rate_sheet_path(*, config: AppConfig, difficulty: Difficulty) -> Path:
@@ -345,6 +369,11 @@ def _df_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 def _email_record_api_shape(item: dict[str, Any]) -> dict[str, Any]:
+    trace_value = item.get("trace")
+    if isinstance(trace_value, str):
+        parsed = _coerce_trace_payload(trace_value)
+        if parsed:
+            trace_value = parsed
     return {
         "id": item.get("id"),
         "time": item.get("created_at"),
@@ -355,9 +384,10 @@ def _email_record_api_shape(item: dict[str, Any]) -> dict[str, Any]:
         "subject": item.get("subject"),
         "body": item.get("body"),
         "reply": item.get("reply"),
-        "trace": item.get("trace"),
+        "trace": trace_value,
         "type": item.get("type"),
         "status": item.get("status"),
+        "confidence": item.get("confidence"),
         "config": item.get("config"),
         "origin_city": item.get("origin_city"),
         "destination_city": item.get("destination_city"),
@@ -366,6 +396,276 @@ def _email_record_api_shape(item: dict[str, Any]) -> dict[str, Any]:
         "transport_type": item.get("transport_type"),
         "has_route": item.get("has_route"),
     }
+
+
+def _first_email_address(text: str | None) -> str | None:
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+
+    m = re.search(r"(?i)\b([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})\b", s)
+    if not m:
+        return None
+    return str(m.group(1)).strip()
+
+
+def _email_domain(text: str | None) -> str | None:
+    email = _first_email_address(text)
+    if not email:
+        return None
+    parts = email.split("@", 1)
+    if len(parts) != 2:
+        return None
+    domain = parts[1].strip().casefold()
+    return domain or None
+
+
+def _coerce_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _split_semicolon_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    s = str(value).strip()
+    if not s:
+        return []
+    parts = re.split(r"\s*;\s*", s)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _coerce_trace_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if value is None:
+        return {}
+
+    if isinstance(value, str):
+        raw = str(value)
+        s = raw.strip()
+        if not s:
+            return {}
+        try:
+            parsed = json.loads(s)
+        except Exception:  # noqa: BLE001
+            return {"raw_trace": raw}
+
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list):
+            return {"steps": parsed}
+        if isinstance(parsed, str):
+            try:
+                parsed2 = json.loads(parsed)
+            except Exception:  # noqa: BLE001
+                return {"raw_trace": raw}
+            if isinstance(parsed2, dict):
+                return parsed2
+            if isinstance(parsed2, list):
+                return {"steps": parsed2}
+
+        return {"raw_trace": raw}
+
+    return {"raw_trace": str(value)}
+
+
+def _hitl_summary_from_trace(trace_payload: dict[str, Any]) -> str:
+    sop_step = _get_trace_step(trace_payload=trace_payload, title="SOP")
+    if not isinstance(sop_step, dict):
+        return "Requires human review based on heuristic signals."
+    sop_data = sop_step.get("data")
+    if not isinstance(sop_data, dict):
+        return "Requires human review based on heuristic signals."
+    matched_profile = sop_data.get("matched_profile")
+    if isinstance(matched_profile, dict):
+        customer_name = str(matched_profile.get("customer_name") or "").strip()
+        if customer_name:
+            return f"Requires human review (related to SOP VIP member: {customer_name})."
+        return "Requires human review (related to SOP VIP member)."
+    return "Requires human review based on heuristic signals."
+
+
+def _extract_clarification_questions(trace_payload: dict[str, Any]) -> list[str]:
+    step = _get_trace_step(trace_payload=trace_payload, title="Clarification Required")
+    if not isinstance(step, dict):
+        return []
+    data = step.get("data")
+    if not isinstance(data, dict):
+        return []
+    questions = data.get("questions")
+    if not isinstance(questions, list):
+        return []
+    return [str(x).strip() for x in questions if str(x).strip()]
+
+
+def _classify_clarifications(questions: list[str]) -> set[str]:
+    if not questions:
+        return set()
+    text = "\n".join(questions).casefold()
+    reasons: set[str] = set()
+    if re.search(r"\borigin\b", text):
+        reasons.add("missing_origin")
+    if re.search(r"\bdestination\b", text):
+        reasons.add("missing_destination")
+    if re.search(r"\bsea\b|\bocean\b|\bair\b|\bfreight\b", text) and re.search(r"\bconfirm\b|\bwhether\b", text):
+        reasons.add("missing_mode")
+    if re.search(r"\bweight\b|\bkg\b|\bcbm\b|\bvolume\b", text):
+        reasons.add("missing_weight_volume")
+    if re.search(r"\bcontainer\b|\b20ft\b|\b40ft\b|\bquantity\b", text):
+        reasons.add("missing_container_info")
+    if not reasons:
+        reasons.add("clarification_required")
+    return reasons
+
+
+def _parse_mode_from_title(title: str) -> str | None:
+    m = re.search(r"\((Air|Sea)\)\s*$", str(title))
+    if not m:
+        return None
+    return str(m.group(1)).strip().casefold()
+
+
+def _find_last_route_index(routes: list[dict[str, Any]], mode: str | None, *, need_field: str) -> int | None:
+    if not mode:
+        return None
+    for i in range(len(routes) - 1, -1, -1):
+        r = routes[i]
+        if str(r.get("mode") or "") != mode:
+            continue
+        if r.get(need_field) is None:
+            return i
+    return None
+
+
+def _extract_routes_from_trace(trace_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    steps = trace_payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+
+    routes: list[dict[str, Any]] = []
+
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        title = str(step.get("title") or "")
+
+        if title.startswith("Normalize Locations ("):
+            mode = _parse_mode_from_title(title)
+            data = step.get("data")
+            origin = None
+            destination = None
+            if isinstance(data, dict):
+                o = data.get("origin")
+                d = data.get("destination")
+                if isinstance(o, dict):
+                    origin = str(o.get("canonical") or "").strip() or None
+                if isinstance(d, dict):
+                    destination = str(d.get("canonical") or "").strip() or None
+            routes.append(
+                {
+                    "mode": mode,
+                    "origin": origin,
+                    "destination": destination,
+                    "rate_found": None,
+                    "transit_days": None,
+                    "final_amount": None,
+                    "currency": None,
+                    "chargeable_weight_kg": None,
+                    "actual_weight_kg": None,
+                    "volume_cbm": None,
+                    "quantity": None,
+                    "container_size_ft": None,
+                }
+            )
+            continue
+
+        if title.startswith("Rate Lookup ("):
+            mode = _parse_mode_from_title(title)
+            idx = _find_last_route_index(routes, mode, need_field="rate_found")
+            if idx is None:
+                continue
+            r = routes[idx]
+            data = step.get("data") if isinstance(step.get("data"), dict) else {}
+            summary = str(step.get("summary") or "")
+
+            if isinstance(data, dict):
+                transit_days = data.get("transit_days")
+                if isinstance(transit_days, bool):
+                    transit_days = None
+                transit_num = _coerce_number(transit_days)
+                if transit_num is not None and float(transit_num).is_integer():
+                    r["transit_days"] = int(transit_num)
+
+            if re.search(r"(?i)\bno\s+direct\b", summary):
+                r["rate_found"] = False
+            else:
+                matched = bool(re.search(r"(?i)\bmatched\b", summary))
+                has_rate_fields = isinstance(data, dict) and any(
+                    k in data for k in ["base_rate", "Rate per kg (USD)", "20ft Price (USD)", "40ft Price (USD)"]
+                )
+                r["rate_found"] = bool(matched or has_rate_fields)
+            continue
+
+        if title.startswith("Calculate Quote ("):
+            mode = _parse_mode_from_title(title)
+            idx = _find_last_route_index(routes, mode, need_field="final_amount")
+            if idx is None:
+                continue
+            r = routes[idx]
+            data = step.get("data")
+            if not isinstance(data, dict):
+                continue
+
+            amt = _coerce_number(data.get("final_amount"))
+            if amt is not None:
+                r["final_amount"] = float(amt)
+            currency = str(data.get("currency") or "").strip()
+            if currency:
+                r["currency"] = currency
+            chargeable = _coerce_number(data.get("chargeable_weight_kg"))
+            if chargeable is not None:
+                r["chargeable_weight_kg"] = float(chargeable)
+            continue
+
+    shipments = _extract_shipments_from_trace(trace_payload)
+    by_mode: dict[str, list[dict[str, Any]]] = {"air": [], "sea": []}
+    for sh in shipments:
+        mode = str(sh.get("mode") or "").strip().casefold()
+        if mode in by_mode:
+            by_mode[mode].append(sh)
+
+    ptr: dict[str, int] = {"air": 0, "sea": 0}
+    for r in routes:
+        mode = str(r.get("mode") or "")
+        if mode not in by_mode:
+            continue
+        i = ptr[mode]
+        if i >= len(by_mode[mode]):
+            continue
+        sh = by_mode[mode][i]
+        ptr[mode] = i + 1
+
+        r["actual_weight_kg"] = _coerce_number(sh.get("actual_weight_kg"))
+        r["volume_cbm"] = _coerce_number(sh.get("volume_cbm"))
+        qty = _coerce_number(sh.get("quantity"))
+        r["quantity"] = int(qty) if qty is not None and float(qty).is_integer() else None
+        size = _coerce_number(sh.get("container_size_ft"))
+        r["container_size_ft"] = int(size) if size is not None and float(size).is_integer() else None
+
+    return routes
 
 
 def _get_trace_step(*, trace_payload: dict[str, Any], title: str) -> dict[str, Any] | None:
@@ -677,6 +977,28 @@ def _decide_reply_type(*, trace_payload: dict[str, Any], email_subject: str, ema
     if reasons:
         return "HITL", reasons
     return "Auto", []
+
+
+def _confidence_from_reply(*, reply_type: str, hitl_reasons: list[dict[str, Any]]) -> str:
+    if str(reply_type) == "Auto":
+        return "high"
+
+    low_codes = {"clarification_required", "pipeline_error", "missing_quote_text"}
+    medium_codes = {
+        "sop_parse_errors",
+        "sop_mode_conflict",
+        "sop_origin_conflict",
+        "large_order",
+        "special_request_notes",
+        "special_request_keywords",
+    }
+
+    codes = {str(r.get("code") or "") for r in hitl_reasons if isinstance(r, dict)}
+    if any(c in low_codes for c in codes):
+        return "low"
+    if any(c in medium_codes for c in codes):
+        return "medium"
+    return "medium"
 
 
 def _rates_payload(*, rates: NormalizedRateSheets, include_rows: bool) -> dict[str, Any]:
@@ -1052,7 +1374,7 @@ def create_app() -> FastAPI:
         if reply_type == "HITL":
             decision_step = {
                 "title": "HITL Decision",
-                "summary": "Requires human review based on heuristic signals.",
+                "summary": _hitl_summary_from_trace(trace_payload),
                 "data": {"type": "HITL", "reasons": hitl_reasons},
                 "used_llm": False,
                 "llm_usage": None,
@@ -1066,6 +1388,7 @@ def create_app() -> FastAPI:
             out["hitl_reasons"] = hitl_reasons
 
         out["type"] = reply_type
+        out["confidence"] = _confidence_from_reply(reply_type=reply_type, hitl_reasons=hitl_reasons)
 
         if payload.include_trace:
             out["trace"] = trace_payload
@@ -1098,6 +1421,7 @@ def create_app() -> FastAPI:
                     trace=trace_payload,
                     record_type=payload.record_type,
                     status=("unprocessed" if result.error else payload.record_status),
+                    confidence=str(out.get("confidence") or "").strip() or None,
                     config=config_payload,
                     origin_city=inferred.get("origin_city"),
                     destination_city=inferred.get("destination_city"),
@@ -1119,6 +1443,19 @@ def create_app() -> FastAPI:
     def create_email_record(payload: EmailRecordCreateRequest) -> dict[str, Any]:
         _load_base_config()  # loads .env
         inferred = _infer_quote_fields_from_trace(payload.trace or {})
+        trace_payload = payload.trace if isinstance(payload.trace, dict) else {}
+        confidence = payload.confidence
+        if confidence is None:
+            reply_type, hitl_reasons = _decide_reply_type(
+                trace_payload=trace_payload,
+                email_subject=str(payload.subject or ""),
+                email_body=str(payload.body or ""),
+            )
+            if not str(payload.reply or "").strip():
+                hitl_reasons.append({"code": "missing_quote_text"})
+            if hitl_reasons:
+                reply_type = "HITL"
+            confidence = str(_confidence_from_reply(reply_type=reply_type, hitl_reasons=hitl_reasons))
         try:
             record_id = insert_email_record(
                 email_id=payload.email_id,
@@ -1130,6 +1467,7 @@ def create_app() -> FastAPI:
                 trace=payload.trace,
                 record_type=payload.type,
                 status=payload.status,
+                confidence=confidence,
                 config=payload.config,
                 origin_city=inferred.get("origin_city"),
                 destination_city=inferred.get("destination_city"),
@@ -1161,6 +1499,7 @@ def create_app() -> FastAPI:
                 record_type=updates.get("type"),
                 reply=updates.get("reply"),
                 trace=updates.get("trace"),
+                confidence=updates.get("confidence"),
                 config=updates.get("config"),
             )
         except DbNotConfiguredError as e:
@@ -1198,6 +1537,463 @@ def create_app() -> FastAPI:
         except DbNotConfiguredError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
         return {"items": items, "limit": int(limit), "offset": int(offset), "count": len(items)}
+
+    @router.get("/stats/senders")
+    def stats_senders(top: int = 50, max_rows: int = 20000, batch_size: int = 1000) -> dict[str, Any]:
+        _load_base_config()  # loads .env
+
+        top_i = max(int(top), 0)
+        max_rows_i = max(int(max_rows), 0)
+        batch_i = max(min(int(batch_size), 5000), 1)
+        if max_rows_i == 0:
+            return {"items": [], "scanned": 0, "max_rows": 0, "reached_max_rows": False}
+
+        counts: dict[str, int] = {}
+        offset = 0
+        scanned = 0
+        while scanned < max_rows_i:
+            limit = min(batch_i, max_rows_i - scanned)
+            try:
+                batch = list_email_records(limit=limit, offset=offset)
+            except DbNotConfiguredError as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
+            if not batch:
+                break
+            for row in batch:
+                sender = _first_email_address(row.get("email_from")) or str(row.get("email_from") or "").strip()
+                if not sender:
+                    continue
+                counts[sender] = int(counts.get(sender) or 0) + 1
+            scanned += len(batch)
+            offset += len(batch)
+            if len(batch) < limit:
+                break
+
+        items = [{"sender": k, "count": v} for k, v in counts.items()]
+        items.sort(key=lambda x: (-int(x["count"]), str(x["sender"]).casefold()))
+        if top_i:
+            items = items[:top_i]
+
+        return {
+            "items": items,
+            "unique_senders": len(counts),
+            "scanned": scanned,
+            "max_rows": max_rows_i,
+            "reached_max_rows": scanned >= max_rows_i,
+        }
+
+    @router.get("/stats/domains")
+    def stats_domains(
+        top: int = 50,
+        exclude_common: bool = True,
+        max_rows: int = 20000,
+        batch_size: int = 1000,
+    ) -> dict[str, Any]:
+        _load_base_config()  # loads .env
+
+        top_i = max(int(top), 0)
+        max_rows_i = max(int(max_rows), 0)
+        batch_i = max(min(int(batch_size), 5000), 1)
+        if max_rows_i == 0:
+            return {"items": [], "scanned": 0, "max_rows": 0, "reached_max_rows": False}
+
+        excluded = set(_COMMON_GENERIC_EMAIL_DOMAINS) if exclude_common else set()
+        counts: dict[str, int] = {}
+        offset = 0
+        scanned = 0
+        while scanned < max_rows_i:
+            limit = min(batch_i, max_rows_i - scanned)
+            try:
+                batch = list_email_records(limit=limit, offset=offset)
+            except DbNotConfiguredError as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
+            if not batch:
+                break
+            for row in batch:
+                domain = _email_domain(row.get("email_from"))
+                if not domain:
+                    continue
+                if domain in excluded:
+                    continue
+                counts[domain] = int(counts.get(domain) or 0) + 1
+            scanned += len(batch)
+            offset += len(batch)
+            if len(batch) < limit:
+                break
+
+        items = [{"domain": k, "count": v} for k, v in counts.items()]
+        items.sort(key=lambda x: (-int(x["count"]), str(x["domain"]).casefold()))
+        if top_i:
+            items = items[:top_i]
+
+        return {
+            "items": items,
+            "unique_domains": len(counts),
+            "excluded_common": bool(exclude_common),
+            "excluded_common_list": sorted(list(excluded)) if exclude_common else [],
+            "scanned": scanned,
+            "max_rows": max_rows_i,
+            "reached_max_rows": scanned >= max_rows_i,
+        }
+
+    @router.get("/stats/origins")
+    def stats_origins(top: int = 50, max_rows: int = 20000, batch_size: int = 1000) -> dict[str, Any]:
+        _load_base_config()  # loads .env
+
+        top_i = max(int(top), 0)
+        max_rows_i = max(int(max_rows), 0)
+        batch_i = max(min(int(batch_size), 5000), 1)
+        if max_rows_i == 0:
+            return {"items": [], "scanned": 0, "max_rows": 0, "reached_max_rows": False}
+
+        counts: dict[str, int] = {}
+        offset = 0
+        scanned = 0
+        while scanned < max_rows_i:
+            limit = min(batch_i, max_rows_i - scanned)
+            try:
+                batch = list_email_records(limit=limit, offset=offset)
+            except DbNotConfiguredError as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
+            if not batch:
+                break
+
+            for row in batch:
+                origins: set[str] = set()
+                trace = row.get("trace")
+                if isinstance(trace, dict):
+                    for r in _extract_routes_from_trace(trace):
+                        origin = str(r.get("origin") or "").strip()
+                        if origin:
+                            origins.add(origin)
+                if not origins:
+                    for origin in _split_semicolon_values(row.get("origin_city")):
+                        origins.add(origin)
+
+                for origin in origins:
+                    counts[origin] = int(counts.get(origin) or 0) + 1
+
+            scanned += len(batch)
+            offset += len(batch)
+            if len(batch) < limit:
+                break
+
+        items = [{"origin_city": k, "count": v} for k, v in counts.items()]
+        items.sort(key=lambda x: (-int(x["count"]), str(x["origin_city"]).casefold()))
+        if top_i:
+            items = items[:top_i]
+
+        return {
+            "items": items,
+            "unique_origins": len(counts),
+            "scanned": scanned,
+            "max_rows": max_rows_i,
+            "reached_max_rows": scanned >= max_rows_i,
+        }
+
+    @router.get("/stats/destinations-weight")
+    def stats_destinations_weight(top: int = 50, max_rows: int = 20000, batch_size: int = 1000) -> dict[str, Any]:
+        base_config = _load_base_config()  # loads .env
+        air_factor = float(base_config.pricing.air_volume_factor or 0.0)
+
+        top_i = max(int(top), 0)
+        max_rows_i = max(int(max_rows), 0)
+        batch_i = max(min(int(batch_size), 5000), 1)
+        if max_rows_i == 0:
+            return {"items": [], "scanned": 0, "max_rows": 0, "reached_max_rows": False}
+
+        stats: dict[str, dict[str, Any]] = {}
+        record_hits: dict[str, set[str]] = {}
+
+        offset = 0
+        scanned = 0
+        while scanned < max_rows_i:
+            limit = min(batch_i, max_rows_i - scanned)
+            try:
+                batch = list_email_records(limit=limit, offset=offset)
+            except DbNotConfiguredError as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
+            if not batch:
+                break
+
+            for row in batch:
+                record_id = str(row.get("id") or "")
+                trace = row.get("trace")
+                if not isinstance(trace, dict):
+                    continue
+                routes = _extract_routes_from_trace(trace)
+                for r in routes:
+                    if str(r.get("mode") or "") != "air":
+                        continue
+                    destination = str(r.get("destination") or "").strip()
+                    if not destination:
+                        continue
+                    entry = stats.get(destination)
+                    if entry is None:
+                        entry = {
+                            "destination_city": destination,
+                            "route_count": 0,
+                            "record_count": 0,
+                            "sum_actual_weight_kg": 0.0,
+                            "sum_volume_cbm": 0.0,
+                            "sum_chargeable_weight_kg": 0.0,
+                        }
+                        stats[destination] = entry
+
+                    entry["route_count"] = int(entry.get("route_count") or 0) + 1
+
+                    actual = _coerce_number(r.get("actual_weight_kg"))
+                    volume = _coerce_number(r.get("volume_cbm"))
+                    if actual is not None:
+                        entry["sum_actual_weight_kg"] = float(entry.get("sum_actual_weight_kg") or 0.0) + float(actual)
+                    if volume is not None:
+                        entry["sum_volume_cbm"] = float(entry.get("sum_volume_cbm") or 0.0) + float(volume)
+
+                    cw = _coerce_number(r.get("chargeable_weight_kg"))
+                    if cw is None and actual is not None and volume is not None and air_factor > 0:
+                        cw = max(float(actual), float(volume) * float(air_factor))
+                    if cw is not None:
+                        entry["sum_chargeable_weight_kg"] = float(entry.get("sum_chargeable_weight_kg") or 0.0) + float(cw)
+
+                    if record_id:
+                        record_hits.setdefault(destination, set()).add(record_id)
+
+            scanned += len(batch)
+            offset += len(batch)
+            if len(batch) < limit:
+                break
+
+        for dest, ids in record_hits.items():
+            if dest in stats:
+                stats[dest]["record_count"] = len(ids)
+
+        items = list(stats.values())
+        items.sort(key=lambda x: (-float(x.get("sum_chargeable_weight_kg") or 0.0), str(x.get("destination_city") or "").casefold()))
+        if top_i:
+            items = items[:top_i]
+
+        return {
+            "items": items,
+            "unique_destinations": len(stats),
+            "units": {"weight": "kg", "volume": "cbm"},
+            "air_volume_factor": air_factor,
+            "scanned": scanned,
+            "max_rows": max_rows_i,
+            "reached_max_rows": scanned >= max_rows_i,
+        }
+
+    @router.get("/stats/routes")
+    def stats_routes(top: int = 100, max_rows: int = 20000, batch_size: int = 1000) -> dict[str, Any]:
+        _load_base_config()  # loads .env
+
+        top_i = max(int(top), 0)
+        max_rows_i = max(int(max_rows), 0)
+        batch_i = max(min(int(batch_size), 5000), 1)
+        if max_rows_i == 0:
+            return {"items": [], "scanned": 0, "max_rows": 0, "reached_max_rows": False}
+
+        counts: dict[str, int] = {}
+        offset = 0
+        scanned = 0
+        while scanned < max_rows_i:
+            limit = min(batch_i, max_rows_i - scanned)
+            try:
+                batch = list_email_records(limit=limit, offset=offset)
+            except DbNotConfiguredError as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
+            if not batch:
+                break
+
+            for row in batch:
+                trace = row.get("trace")
+                route_keys: set[str] = set()
+                if isinstance(trace, dict):
+                    for r in _extract_routes_from_trace(trace):
+                        mode = str(r.get("mode") or "").strip() or "unknown"
+                        origin = str(r.get("origin") or "").strip() or "unknown"
+                        destination = str(r.get("destination") or "").strip() or "unknown"
+                        route_keys.add(f"{mode}: {origin} -> {destination}")
+                if not route_keys:
+                    modes = _split_semicolon_values(row.get("transport_type"))
+                    origins = _split_semicolon_values(row.get("origin_city"))
+                    destinations = _split_semicolon_values(row.get("destination_city"))
+                    mode = modes[0] if modes else (str(row.get("transport_type") or "").strip() or "unknown")
+                    for o in origins or ["unknown"]:
+                        for d in destinations or ["unknown"]:
+                            route_keys.add(f"{mode}: {o} -> {d}")
+
+                for k in route_keys:
+                    counts[k] = int(counts.get(k) or 0) + 1
+
+            scanned += len(batch)
+            offset += len(batch)
+            if len(batch) < limit:
+                break
+
+        items = [{"route": k, "count": v} for k, v in counts.items()]
+        items.sort(key=lambda x: (-int(x["count"]), str(x["route"]).casefold()))
+        if top_i:
+            items = items[:top_i]
+
+        return {
+            "items": items,
+            "unique_routes": len(counts),
+            "scanned": scanned,
+            "max_rows": max_rows_i,
+            "reached_max_rows": scanned >= max_rows_i,
+        }
+
+    @router.get("/stats/types")
+    def stats_types(max_rows: int = 20000, batch_size: int = 1000) -> dict[str, Any]:
+        _load_base_config()  # loads .env
+
+        max_rows_i = max(int(max_rows), 0)
+        batch_i = max(min(int(batch_size), 5000), 1)
+        if max_rows_i == 0:
+            return {"record_type_counts": {}, "transport_type_counts": {}, "scanned": 0, "max_rows": 0, "reached_max_rows": False}
+
+        record_type_counts: dict[str, int] = {}
+        transport_type_counts: dict[str, int] = {}
+
+        offset = 0
+        scanned = 0
+        while scanned < max_rows_i:
+            limit = min(batch_i, max_rows_i - scanned)
+            try:
+                batch = list_email_records(limit=limit, offset=offset)
+            except DbNotConfiguredError as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
+            if not batch:
+                break
+
+            for row in batch:
+                rt = str(row.get("type") or "unknown").strip() or "unknown"
+                record_type_counts[rt] = int(record_type_counts.get(rt) or 0) + 1
+
+                tt = str(row.get("transport_type") or "unknown").strip() or "unknown"
+                transport_type_counts[tt] = int(transport_type_counts.get(tt) or 0) + 1
+
+            scanned += len(batch)
+            offset += len(batch)
+            if len(batch) < limit:
+                break
+
+        return {
+            "record_type_counts": record_type_counts,
+            "transport_type_counts": transport_type_counts,
+            "scanned": scanned,
+            "max_rows": max_rows_i,
+            "reached_max_rows": scanned >= max_rows_i,
+        }
+
+    @router.get("/stats/unsatisfied-routes")
+    def stats_unsatisfied_routes(
+        top: int = 100,
+        sample_per_route: int = 3,
+        max_rows: int = 20000,
+        batch_size: int = 1000,
+    ) -> dict[str, Any]:
+        _load_base_config()  # loads .env
+
+        top_i = max(int(top), 0)
+        sample_i = max(min(int(sample_per_route), 20), 0)
+        max_rows_i = max(int(max_rows), 0)
+        batch_i = max(min(int(batch_size), 5000), 1)
+        if max_rows_i == 0:
+            return {"items": [], "reason_counts": {}, "scanned": 0, "max_rows": 0, "reached_max_rows": False}
+
+        per_route: dict[str, dict[str, Any]] = {}
+        reason_counts: dict[str, int] = {}
+
+        offset = 0
+        scanned = 0
+        while scanned < max_rows_i:
+            limit = min(batch_i, max_rows_i - scanned)
+            try:
+                batch = list_email_records(limit=limit, offset=offset)
+            except DbNotConfiguredError as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
+            if not batch:
+                break
+
+            for row in batch:
+                record_id = str(row.get("id") or "")
+                trace = row.get("trace")
+                if not isinstance(trace, dict):
+                    continue
+                routes = _extract_routes_from_trace(trace)
+                clarifications = _extract_clarification_questions(trace)
+                clar_reasons = _classify_clarifications(clarifications)
+
+                for r in routes:
+                    mode = str(r.get("mode") or "").strip() or "unknown"
+                    origin = str(r.get("origin") or "").strip() or "unknown"
+                    destination = str(r.get("destination") or "").strip() or "unknown"
+                    route_key = f"{mode}: {origin} -> {destination}"
+
+                    issues: set[str] = set()
+                    if r.get("rate_found") is False:
+                        issues.add("rate_not_found")
+                    if r.get("rate_found") is True and r.get("transit_days") is None:
+                        issues.add("missing_transit_days")
+                    if r.get("final_amount") is None:
+                        if "missing_origin" in clar_reasons or "missing_destination" in clar_reasons:
+                            issues.add("missing_location")
+                        if mode == "air" and "missing_weight_volume" in clar_reasons:
+                            issues.add("missing_weight_volume")
+                        if mode == "sea" and "missing_container_info" in clar_reasons:
+                            issues.add("missing_container_info")
+                        if not issues and clar_reasons:
+                            issues |= set(clar_reasons)
+                        if not issues:
+                            issues.add("quote_not_generated")
+
+                    if not issues:
+                        continue
+
+                    entry = per_route.get(route_key)
+                    if entry is None:
+                        entry = {
+                            "route": route_key,
+                            "mode": mode,
+                            "origin_city": origin,
+                            "destination_city": destination,
+                            "count": 0,
+                            "reasons": {},
+                            "sample_record_ids": [],
+                        }
+                        per_route[route_key] = entry
+
+                    entry["count"] = int(entry.get("count") or 0) + 1
+                    reasons_dict: dict[str, int] = entry.get("reasons") if isinstance(entry.get("reasons"), dict) else {}
+                    for reason in sorted(list(issues)):
+                        reasons_dict[reason] = int(reasons_dict.get(reason) or 0) + 1
+                        reason_counts[reason] = int(reason_counts.get(reason) or 0) + 1
+                    entry["reasons"] = reasons_dict
+
+                    if sample_i and record_id:
+                        samples: list[str] = entry.get("sample_record_ids") if isinstance(entry.get("sample_record_ids"), list) else []
+                        if record_id not in samples and len(samples) < sample_i:
+                            entry["sample_record_ids"] = [*samples, record_id]
+
+            scanned += len(batch)
+            offset += len(batch)
+            if len(batch) < limit:
+                break
+
+        items = list(per_route.values())
+        items.sort(key=lambda x: (-int(x.get("count") or 0), str(x.get("route") or "").casefold()))
+        if top_i:
+            items = items[:top_i]
+
+        return {
+            "items": items,
+            "reason_counts": reason_counts,
+            "unique_routes": len(per_route),
+            "scanned": scanned,
+            "max_rows": max_rows_i,
+            "reached_max_rows": scanned >= max_rows_i,
+        }
 
     @router.post("/email-records/decision")
     def decide_email_record(
@@ -1243,12 +2039,7 @@ def create_app() -> FastAPI:
                 final_quote = refined_quote
 
         existing_trace = record.get("trace")
-        if isinstance(existing_trace, dict):
-            trace_payload: dict[str, Any] = dict(existing_trace)
-        elif existing_trace is None:
-            trace_payload = {}
-        else:
-            trace_payload = {"raw_trace": existing_trace}
+        trace_payload = _coerce_trace_payload(existing_trace)
 
         step = {
             "title": "Human Decision",

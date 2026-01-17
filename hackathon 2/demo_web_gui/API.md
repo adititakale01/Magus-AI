@@ -237,6 +237,7 @@ Response (abridged):
   "quote_text": "Hi,\\n\\nThank you ...",
   "error": null,
   "type": "Auto",
+  "confidence": "high",
   "origin_city": "Shanghai",
   "destination_city": "Rotterdam",
   "price": 12345,
@@ -279,6 +280,7 @@ Body:
   "trace": { "steps": [] },
   "type": "auto",
   "status": "needs_human_decision",
+  "confidence": "high",
   "config": { "difficulty": "easy", "enable_sop": true }
 }
 ```
@@ -293,6 +295,7 @@ Body (any subset):
 {
   "status": "human_confirmed_replied",
   "type": "human",
+  "confidence": "low",
   "reply": "Final reply text..."
 }
 ```
@@ -320,6 +323,7 @@ Response:
       "reply": "...",
       "type": "auto",
       "status": "needs_human_decision",
+      "confidence": "high",
       "config": { "difficulty": "easy", "enable_sop": true },
       "origin_city": "Shanghai",
       "destination_city": "Rotterdam",
@@ -380,3 +384,180 @@ Behavior:
 - Always updates the record `type` to `human` and stores the decision in `trace`.
 - If `decision=accept`, calls `MAKE_WEBHOOK_URL` (default is the Make.com hook) and then sets `status=human_confirmed_replied`.
 - If `decision=reject`, does not call the webhook and sets `status=human_rejected`.
+
+---
+
+## Stats (basic dashboard)
+
+Notes:
+- These endpoints require persistence configuration (Supabase REST or `DATABASE_URL`).
+- Stats are computed by scanning recent rows (paged list) up to `max_rows`.
+
+### Senders (count)
+`GET /api/v1/stats/senders`
+
+Query params:
+- `top` (default `50`)
+- `max_rows` (default `20000`)
+- `batch_size` (default `1000`)
+
+Response:
+```json
+{
+  "items": [{ "sender": "someone@corp.com", "count": 12 }],
+  "unique_senders": 30,
+  "scanned": 200,
+  "max_rows": 20000,
+  "reached_max_rows": false
+}
+```
+
+---
+
+### Domains (count, excluding common personal email domains)
+`GET /api/v1/stats/domains`
+
+Query params:
+- `top` (default `50`)
+- `exclude_common` (default `true`)
+- `max_rows` (default `20000`)
+- `batch_size` (default `1000`)
+
+Response:
+```json
+{
+  "items": [{ "domain": "corp.com", "count": 18 }],
+  "unique_domains": 10,
+  "excluded_common": true,
+  "excluded_common_list": ["gmail.com", "outlook.com"],
+  "scanned": 200,
+  "max_rows": 20000,
+  "reached_max_rows": false
+}
+```
+
+---
+
+### Origins (count)
+`GET /api/v1/stats/origins`
+
+Query params:
+- `top` (default `50`)
+- `max_rows` (default `20000`)
+- `batch_size` (default `1000`)
+
+Response:
+```json
+{
+  "items": [{ "origin_city": "Shanghai", "count": 22 }],
+  "unique_origins": 12,
+  "scanned": 200,
+  "max_rows": 20000,
+  "reached_max_rows": false
+}
+```
+
+---
+
+### Destinations (air weight aggregation)
+`GET /api/v1/stats/destinations-weight`
+
+Query params:
+- `top` (default `50`)
+- `max_rows` (default `20000`)
+- `batch_size` (default `1000`)
+
+Response:
+```json
+{
+  "items": [
+    {
+      "destination_city": "Frankfurt",
+      "route_count": 3,
+      "record_count": 2,
+      "sum_actual_weight_kg": 450,
+      "sum_volume_cbm": 2,
+      "sum_chargeable_weight_kg": 500
+    }
+  ],
+  "units": { "weight": "kg", "volume": "cbm" },
+  "air_volume_factor": 167,
+  "scanned": 200,
+  "max_rows": 20000,
+  "reached_max_rows": false
+}
+```
+
+---
+
+### Routes (count)
+`GET /api/v1/stats/routes`
+
+Query params:
+- `top` (default `100`)
+- `max_rows` (default `20000`)
+- `batch_size` (default `1000`)
+
+Response:
+```json
+{
+  "items": [{ "route": "air: San Francisco -> Frankfurt", "count": 5 }],
+  "unique_routes": 20,
+  "scanned": 200,
+  "max_rows": 20000,
+  "reached_max_rows": false
+}
+```
+
+---
+
+### Types (record type + transport type)
+`GET /api/v1/stats/types`
+
+Query params:
+- `max_rows` (default `20000`)
+- `batch_size` (default `1000`)
+
+Response:
+```json
+{
+  "record_type_counts": { "auto": 10, "human": 2 },
+  "transport_type_counts": { "air": 6, "sea": 6 },
+  "scanned": 12,
+  "max_rows": 20000,
+  "reached_max_rows": false
+}
+```
+
+---
+
+### Unsatisfied routes (details + reason counts)
+`GET /api/v1/stats/unsatisfied-routes`
+
+Query params:
+- `top` (default `100`)
+- `sample_per_route` (default `3`)
+- `max_rows` (default `20000`)
+- `batch_size` (default `1000`)
+
+Response (abridged):
+```json
+{
+  "items": [
+    {
+      "route": "sea: Shanghai -> Gdansk",
+      "mode": "sea",
+      "origin_city": "Shanghai",
+      "destination_city": "Gdansk",
+      "count": 2,
+      "reasons": { "rate_not_found": 2 },
+      "sample_record_ids": ["uuid-1", "uuid-2"]
+    }
+  ],
+  "reason_counts": { "rate_not_found": 2, "missing_transit_days": 1 },
+  "unique_routes": 5,
+  "scanned": 200,
+  "max_rows": 20000,
+  "reached_max_rows": false
+}
+```

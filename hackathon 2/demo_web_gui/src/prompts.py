@@ -24,7 +24,10 @@ EXTRACTION_SYSTEM_PROMPT = (
     "(e.g., DDP/DAP/DDU, customs clearance, insurance, dangerous goods, lithium batteries, temperature control, urgency/deadlines,\n"
     "documentation requirements). If none, set notes to null.\n"
     "If an email contains multiple routes, return multiple shipments.\n"
-    "If info is missing, use null and add a clarification question.\n"
+    "Only add clarification questions when they are REQUIRED to compute an accurate price quote (blocking questions).\n"
+    "Do NOT add clarification questions for optional fields that do not affect pricing in this demo (e.g., `commodity`, HS code).\n"
+    "If optional info is missing, set it to null and leave clarification_questions empty.\n"
+    "If info required for pricing is missing, use null and add a clarification question.\n"
     "Do not invent values."
 )
 

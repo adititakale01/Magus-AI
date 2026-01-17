@@ -20,6 +20,7 @@ from src.db_store import (
     list_email_records,
     list_needs_human_decision,
 )
+from api_server import _confidence_from_reply, _decide_reply_type
 from src.pipeline import run_quote_pipeline
 from src.rate_sheets import NormalizedRateSheets, normalize_rate_sheets
 from src.sop import SopParseResult, load_sop_markdown, parse_sop
@@ -669,6 +670,19 @@ def main() -> None:
                     "use_openai": bool(use_openai),
                 }
                 try:
+                    reply_type, hitl_reasons = _decide_reply_type(
+                        trace_payload=trace_payload,
+                        email_subject=str(email.subject or ""),
+                        email_body=str(email.body or ""),
+                    )
+                    if result.error:
+                        hitl_reasons.append({"code": "pipeline_error", "detail": str(result.error)})
+                    if not result.quote_text:
+                        hitl_reasons.append({"code": "missing_quote_text"})
+                    if hitl_reasons:
+                        reply_type = "HITL"
+                    confidence = _confidence_from_reply(reply_type=reply_type, hitl_reasons=hitl_reasons)
+
                     record_id = insert_email_record(
                         email_id=email.email_id,
                         email_from=email.sender,
@@ -679,6 +693,7 @@ def main() -> None:
                         trace=trace_payload,
                         record_type="auto",
                         status=("unprocessed" if result.error else "needs_human_decision"),
+                        confidence=confidence,
                         config=config_payload,
                         origin_city=inferred.get("origin_city"),
                         destination_city=inferred.get("destination_city"),

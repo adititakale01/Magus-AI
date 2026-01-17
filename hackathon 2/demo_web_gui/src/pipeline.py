@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import re
 
 from src.agent import ShipmentRequest, extract_requests
 from src.config import AppConfig
@@ -25,6 +26,36 @@ from src.sop import (
     volume_discount_pct,
 )
 from src.trace import RunTrace
+
+
+_OPTIONAL_QUESTION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?i)\bcommodity\b"),
+    re.compile(r"(?i)\bhs\s*code\b"),
+    re.compile(r"(?i)\bharmonized\s+system\b"),
+    re.compile(r"(?i)\bproduct\s+type\b"),
+    re.compile(r"(?i)\btype\s+of\s+goods\b"),
+]
+
+_DANGEROUS_GOODS_QUESTION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?i)\bdg\b"),
+    re.compile(r"(?i)\bdangerous\s*goods\b"),
+    re.compile(r"(?i)\bhazard(?:ous)?\b"),
+    re.compile(r"(?i)\blithium\b"),
+    re.compile(r"(?i)\bbattery\b"),
+    re.compile(r"(?i)\bmsds\b"),
+]
+
+
+def _filter_clarification_questions(questions: list[str]) -> list[str]:
+    out: list[str] = []
+    for q in questions:
+        text = str(q or "").strip()
+        if not text:
+            continue
+        if any(p.search(text) for p in _OPTIONAL_QUESTION_PATTERNS) and not any(p.search(text) for p in _DANGEROUS_GOODS_QUESTION_PATTERNS):
+            continue
+        out.append(text)
+    return out
 
 
 @dataclass(frozen=True)
@@ -215,7 +246,7 @@ def run_quote_pipeline(
         },
     )
 
-    clarifications: list[str] = list(extraction.clarification_questions)
+    clarifications: list[str] = _filter_clarification_questions(list(extraction.clarification_questions))
     container_discount_pct = 0.0
     container_discount_label: str | None = None
     container_qty_estimates: list[int | None] = [None] * len(extraction.shipments)
@@ -624,9 +655,10 @@ def run_quote_pipeline(
         clarifications.append("Please confirm whether this is sea freight or air freight.")
 
     if not quotes:
-        if not clarifications:
-            return PipelineResult(quote_text=None, trace=trace, error="No shipments could be parsed from the email.")
         email_text = f"{email.subject}\n{email.body}".casefold()
+        if not clarifications:
+            clarifications.append("What is the origin (city/port/airport)?")
+            clarifications.append("What is the destination (city/port/airport)?")
         has_mode_signal = any(k in email_text for k in ["air", "ocean", "sea", "container"])
         has_quantity_signal = bool(clean_text(email_text) and any(k in email_text for k in ["20ft", "40ft", "cbm", "kg"]))
         if not has_mode_signal:

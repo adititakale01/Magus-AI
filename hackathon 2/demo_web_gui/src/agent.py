@@ -36,6 +36,38 @@ class ExtractionResult:
     clarification_questions: list[str] = field(default_factory=list)
 
 
+_OPTIONAL_CLARIFICATION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?i)\bcommodity\b"),
+    re.compile(r"(?i)\bhs\s*code\b"),
+    re.compile(r"(?i)\bharmonized\s+system\b"),
+    re.compile(r"(?i)\bproduct\s+type\b"),
+    re.compile(r"(?i)\btype\s+of\s+goods\b"),
+]
+
+_DANGEROUS_GOODS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?i)\bdg\b"),
+    re.compile(r"(?i)\bdangerous\s*goods\b"),
+    re.compile(r"(?i)\bhazard(?:ous)?\b"),
+    re.compile(r"(?i)\blithium\b"),
+    re.compile(r"(?i)\bbattery\b"),
+    re.compile(r"(?i)\bmsds\b"),
+]
+
+
+def _filter_optional_clarification_questions(questions: list[str]) -> list[str]:
+    out: list[str] = []
+    for q in questions:
+        text = str(q or "").strip()
+        if not text:
+            continue
+        if any(p.search(text) for p in _OPTIONAL_CLARIFICATION_PATTERNS) and not any(
+            p.search(text) for p in _DANGEROUS_GOODS_PATTERNS
+        ):
+            continue
+        out.append(text)
+    return out
+
+
 def extract_requests(
     *,
     email: EmailMessage,
@@ -56,6 +88,21 @@ def extract_requests(
                 used_llm=True,
                 llm_usage=llm_usage,
             )
+            if not res.shipments:
+                trace.add(
+                    "Extraction: OpenAI (empty)",
+                    summary="LLM returned no shipments; falling back to rule-based extraction.",
+                )
+                fallback = _extract_rule_based(email=email)
+                trace.add(
+                    "Extraction: Rule-based",
+                    summary="Parsed structured request(s) via regex rules (fallback after empty LLM parse).",
+                    data={
+                        "shipments": [asdict(s) for s in fallback.shipments],
+                        "clarification_questions": res.clarification_questions,
+                    },
+                )
+                return ExtractionResult(shipments=fallback.shipments, clarification_questions=res.clarification_questions)
             return res
         except Exception as e:  # noqa: BLE001
             trace.add(
@@ -122,8 +169,9 @@ def _extract_with_openai(*, email: EmailMessage, config: AppConfig) -> tuple[Ext
         questions = data.get("clarification_questions")
         if not isinstance(questions, list):
             questions = []
+        questions_out = _filter_optional_clarification_questions([str(q) for q in questions])
         return (
-            ExtractionResult(shipments=shipments, clarification_questions=[str(q) for q in questions if str(q).strip()]),
+            ExtractionResult(shipments=shipments, clarification_questions=questions_out),
             llm_usage,
         )
 
@@ -141,7 +189,11 @@ def _extract_with_openai(*, email: EmailMessage, config: AppConfig) -> tuple[Ext
         commodity=_none_if_blank(data.get("commodity")),
         notes=_none_if_blank(data.get("notes")),
     )
-    return ExtractionResult(shipments=[single], clarification_questions=[]), llm_usage
+    questions = data.get("clarification_questions")
+    if not isinstance(questions, list):
+        questions = []
+    questions_out = _filter_optional_clarification_questions([str(q) for q in questions])
+    return ExtractionResult(shipments=[single], clarification_questions=questions_out), llm_usage
 
 
 def _extract_rule_based(*, email: EmailMessage) -> ExtractionResult:

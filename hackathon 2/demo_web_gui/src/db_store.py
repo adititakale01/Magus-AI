@@ -146,6 +146,7 @@ _SCHEMA_STATEMENTS: list[str] = [
 
         type text NOT NULL DEFAULT 'auto',
         status text NOT NULL DEFAULT 'unprocessed',
+        confidence text NULL,
         config jsonb NULL,
 
         origin_city text NULL,
@@ -156,6 +157,7 @@ _SCHEMA_STATEMENTS: list[str] = [
         has_route boolean NULL
     );
     """,
+    "ALTER TABLE public.email_quote_records ADD COLUMN IF NOT EXISTS confidence text NULL;",
     "ALTER TABLE public.email_quote_records ADD COLUMN IF NOT EXISTS origin_city text NULL;",
     "ALTER TABLE public.email_quote_records ADD COLUMN IF NOT EXISTS destination_city text NULL;",
     "ALTER TABLE public.email_quote_records ADD COLUMN IF NOT EXISTS price double precision NULL;",
@@ -173,6 +175,20 @@ _SCHEMA_STATEMENTS: list[str] = [
             ALTER TABLE public.email_quote_records
                 ADD CONSTRAINT email_quote_records_type_chk
                 CHECK (type IN ('auto', 'human'));
+        END IF;
+    END $$;
+    """,
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'email_quote_records_confidence_chk'
+        ) THEN
+            ALTER TABLE public.email_quote_records
+                ADD CONSTRAINT email_quote_records_confidence_chk
+                CHECK (confidence IS NULL OR confidence IN ('high', 'medium', 'low'));
         END IF;
     END $$;
     """,
@@ -260,6 +276,7 @@ def insert_email_record(
     trace: dict[str, Any] | None,
     record_type: EmailRecordType = "auto",
     status: EmailRecordStatus = "needs_human_decision",
+    confidence: str | None = None,
     config: dict[str, Any] | None,
     origin_city: str | None = None,
     destination_city: str | None = None,
@@ -284,6 +301,7 @@ def insert_email_record(
                     "trace": _jsonable(trace) if trace is not None else None,
                     "type": str(record_type),
                     "status": str(status),
+                    "confidence": confidence,
                     "config": _jsonable(config) if config is not None else None,
                     "origin_city": origin_city,
                     "destination_city": destination_city,
@@ -307,12 +325,12 @@ def insert_email_record(
                 INSERT INTO public.email_quote_records (
                     id, email_id, email_from, email_to, subject, body,
                     reply, trace,
-                    type, status, config,
+                    type, status, confidence, config,
                     origin_city, destination_city, price, currency, transport_type, has_route
                 ) VALUES (
                     %(id)s, %(email_id)s, %(email_from)s, %(email_to)s, %(subject)s, %(body)s,
                     %(reply)s, %(trace)s,
-                    %(type)s, %(status)s, %(config)s,
+                    %(type)s, %(status)s, %(confidence)s, %(config)s,
                     %(origin_city)s, %(destination_city)s, %(price)s, %(currency)s, %(transport_type)s, %(has_route)s
                 );
                 """,
@@ -327,6 +345,7 @@ def insert_email_record(
                     "trace": Jsonb(_jsonable(trace)) if trace is not None else None,
                     "type": str(record_type),
                     "status": str(status),
+                    "confidence": confidence,
                     "config": Jsonb(_jsonable(config)) if config is not None else None,
                     "origin_city": origin_city,
                     "destination_city": destination_city,
@@ -352,6 +371,7 @@ _EMAIL_RECORD_SELECT_COLUMNS = """
     trace,
     type,
     status,
+    confidence,
     config,
     origin_city,
     destination_city,
@@ -449,6 +469,7 @@ def list_email_records(*, limit: int = 50, offset: int = 0) -> list[dict[str, An
                     trace,
                     type,
                     status,
+                    confidence,
                     config,
                     origin_city,
                     destination_city,
@@ -546,6 +567,7 @@ def list_needs_human_decision(*, limit: int = 200, offset: int = 0) -> list[dict
                     trace,
                     type,
                     status,
+                    confidence,
                     config,
                     origin_city,
                     destination_city,
@@ -571,6 +593,7 @@ def update_email_record(
     record_type: EmailRecordType | None = None,
     reply: str | None = None,
     trace: dict[str, Any] | None = None,
+    confidence: str | None = None,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     record_uuid = _coerce_uuid(record_id)
@@ -587,6 +610,8 @@ def update_email_record(
             updates["reply"] = str(reply)
         if trace is not None:
             updates["trace"] = _jsonable(trace)
+        if confidence is not None:
+            updates["confidence"] = str(confidence)
         if config is not None:
             updates["config"] = _jsonable(config)
 
@@ -624,6 +649,9 @@ def update_email_record(
     if trace is not None:
         sets.append("trace = %(trace)s")
         params["trace"] = Jsonb(_jsonable(trace))
+    if confidence is not None:
+        sets.append("confidence = %(confidence)s")
+        params["confidence"] = str(confidence)
     if config is not None:
         sets.append("config = %(config)s")
         params["config"] = Jsonb(_jsonable(config))

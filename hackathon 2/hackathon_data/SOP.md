@@ -76,6 +76,22 @@ Rules
 | QuickShip UK | 8% margin (broker) | Hide margin % |
 | VietExport | Standard | HCMC origin only |
 | Australia destination | +$150 biosecurity | All shipments |
+## SOP 4: Global Imports Ltd
+
+Customer Email: li-hj@outlook.com  
+Account Type: Strategic Partner  
+Discount: 10% off all sea freight rates
+
+Rules
+- Apply the 10% discount **before** adding margin (discount applies to the base rate).
+- Sea freight **only** — do not quote air freight.
+- Shanghai and Ningbo are interchangeable as origins for rate matching.
+- Always include transit time in the response.
+
+Calculation Example
+- Base rate: $3,200  
+- After 10% discount: $2,880  
+- After 15% margin: $3,312
 
 ---
 
