@@ -36,6 +36,14 @@ def calculate_quote(
     line_items: list[QuoteLineItem] = []
     sop = enriched.customer_sop
 
+    # Calculate TOTAL containers across all routes (for volume discount)
+    # SOP: "Apply volume discount based on total containers across all routes"
+    total_containers = sum(
+        es.shipment.quantity or 1
+        for es in enriched.shipments
+        if es.shipment.mode == "sea"
+    )
+
     for i, (enriched_shipment, rate_match) in enumerate(
         zip(enriched.shipments, rate_matches)
     ):
@@ -44,6 +52,7 @@ def calculate_quote(
             enriched_shipment=enriched_shipment,
             rate_match=rate_match,
             sop=sop,
+            total_containers=total_containers,
         )
         line_items.append(line_item)
 
@@ -80,6 +89,7 @@ def _calculate_line_item(
     enriched_shipment: EnrichedShipment,
     rate_match: RateMatch | None,
     sop: CustomerSOP,
+    total_containers: int = 1,
 ) -> QuoteLineItem:
     """Calculate a single line item."""
     shipment = enriched_shipment.shipment
@@ -115,7 +125,8 @@ def _calculate_line_item(
             )
 
     # === STEP 2: Calculate discount ===
-    discount_percent = _calculate_discount_percent(sop, shipment.quantity or 1)
+    # Use TOTAL containers across all routes for volume discount (per SOP)
+    discount_percent = _calculate_discount_percent(sop, total_containers)
 
     # === STEP 3: Apply discount and margin ===
     if sop.discount_before_margin:

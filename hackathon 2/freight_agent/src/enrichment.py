@@ -399,6 +399,63 @@ Remember to:
         )
         assistant_message = response.choices[0].message
 
+    # SAFEGUARD: Force validation for any shipments GPT skipped
+    validated_indices = {vr.get("shipment_index") for vr in validation_results}
+    expected_indices = set(range(len(extraction.shipments)))
+    unvalidated_indices = expected_indices - validated_indices
+
+    while unvalidated_indices:
+        # Force GPT to validate remaining shipments
+        missing_list = sorted(unvalidated_indices)
+        messages.append({
+            "role": "user",
+            "content": f"You missed validating shipment(s) at index {missing_list}. Call validate_shipment for each one now."
+        })
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=[VALIDATION_TOOL],
+            tool_choice={"type": "function", "function": {"name": "validate_shipment"}},  # Force tool call
+            temperature=0
+        )
+        assistant_message = response.choices[0].message
+
+        if assistant_message.tool_calls:
+            messages.append(assistant_message)
+            for tool_call in assistant_message.tool_calls:
+                if tool_call.function.name == "validate_shipment":
+                    args = json.loads(tool_call.function.arguments)
+                    result = handle_validate_shipment(**args)
+                    validation_results.append(result)
+                    validated_indices.add(args.get("shipment_index"))
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(result)
+                    })
+
+        unvalidated_indices = expected_indices - validated_indices
+
+    # Final call to get JSON response after forced validations (if any were forced)
+    if len(validation_results) > 0 and not assistant_message.content:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=[VALIDATION_TOOL],
+            tool_choice="none",  # No more tool calls, just give us the JSON
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "enrichment_result",
+                    "strict": True,
+                    "schema": ENRICHMENT_SCHEMA
+                }
+            },
+            temperature=0
+        )
+        assistant_message = response.choices[0].message
+
     # Parse final response
     result_json = json.loads(assistant_message.content)
 
